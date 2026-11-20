@@ -804,7 +804,7 @@
           <div class="flex flex-wrap items-center gap-2 text-[11px] mt-0.5">
             <span id="topBlueSummary" class="font-mono font-bold text-blue-300">藍 8子 / HP 74</span>
             <span class="text-slate-600">|</span>
-            <span id="topRedSummary" class="font-mono font-bold text-red-300">紅 已見 0 子</span>
+            <span id="topRedSummary" class="font-mono font-bold text-red-300">紅 8 子 / HP 74</span>
             <span class="text-slate-600 hidden sm:inline">|</span>
             <span id="topHillSummary" class="font-mono text-amber-300 hidden sm:inline">高地 藍0 · 紅已見0</span>
           </div>
@@ -818,6 +818,8 @@
           <select id="aiDifficulty">
             <option value="recruit">新兵 · 單步評估</option>
             <option value="warrior">戰士 · 預判回應</option>
+            <option value="general">將軍 · 迷霧推演</option>
+            <option value="marshal">元帥 · 深度推演</option>
           </select>
         </label>
         <button id="btnModeHotseat" class="control-button">切換雙人熱座</button>
@@ -996,7 +998,7 @@
             <li><strong>斬首勝利：</strong>擊殺敵方「旗手（9 HP）」立即獲勝。</li>
             <li><strong>120 回合上限：</strong>雙方各 60 動仍未分勝負時，依序比較：① 雙方存活單位<strong>總剩餘生命值</strong> → ② 全圖<strong>高地格佔領數</strong> → 平手。</li>
             <li><strong>操作與落子無悔：</strong>點選己方單位同時顯示藍格移動範圍（金⚡為衝鋒落點）與紅框原地攻擊目標。點擊紅框直接原地開火；點擊藍格立即鎖定移動不可悔棋。</li>
-            <li><strong>人機模式節奏：</strong>藍方先手對戰紅方電腦（新兵依當前視野選招，戰士也會參考近期目擊情報）。藍方攻擊、觸發伏擊或移動後無可攻目標時自動輪到 AI；移動後若有可攻目標，可選攻擊或點「不攻擊並結束回合」。</li>
+            <li><strong>人機模式節奏：</strong>藍方先手對戰紅方電腦（新兵依視野選招，戰士預判回應，將軍與元帥會推演迷霧中的可能盤面）。藍方攻擊、觸發伏擊或移動後無可攻目標時自動輪到 AI；移動後若有可攻目標，可選攻擊或點「不攻擊並結束回合」。</li>
           </ul>
         </div>
         <div>
@@ -1131,7 +1133,9 @@
    * ========================================================= */
   const DIFFICULTIES = {
     recruit: { name: '新兵', delay: 350 },
-    warrior: { name: '戰士', delay: 450 }
+    warrior: { name: '戰士', delay: 450 },
+    general: { name: '將軍', delay: 0, budget: 570, deadline: 700, minTime: 400 },
+    marshal: { name: '元帥', delay: 0, budget: 3070, deadline: 3500, minTime: 600 }
   };
   let currentMode = 'pve';
   let currentDifficulty = 'recruit';
@@ -1141,6 +1145,8 @@
   let floatEffects = [];
   let ambushFlashCoord = null;
   let aiTimer = null;
+  let activeAiSearch = null;
+  let nextAiSearchId = 0;
   let confirmationAction = null;
   let focusBeforeModal = null;
   let audioContext = null;
@@ -1156,6 +1162,199 @@
   const opponentOf = (faction) => (faction === 'blue' ? 'red' : 'blue');
   const factionName = (faction) => (faction === 'blue' ? '藍方' : '紅方');
   const isPvE = () => currentMode === 'pve';
+
+  /* 高階 AI 使用格位索引，地形資料由原有視野與移動規則產生。 */
+  const cellIndex = (x, y) => y * BOARD_SIZE + x;
+  const CELL_COUNT = BOARD_SIZE * BOARD_SIZE;
+  const VISION_WORDS = Math.ceil(CELL_COUNT / 32);
+  const TYPE_NAMES = ['flag', 'shield', 'spear', 'archer', 'cavalry'];
+  const BLUE_SLOTS = INITIAL_BLUE_UNITS.length;
+  const advancedGeometry = new WeakMap();
+  const isWorkerDifficulty = difficulty => difficulty === 'general' || difficulty === 'marshal';
+
+  function advancedGeometryFor(map) {
+    const cached = advancedGeometry.get(map);
+    if (cached) return cached;
+
+    const terrain = new Uint8Array(CELL_COUNT);
+    const neighbors = new Int16Array(CELL_COUNT * DIRS.length).fill(-1);
+    const costs = new Uint8Array(neighbors.length);
+    const distance = new Uint8Array(CELL_COUNT * CELL_COUNT);
+    const scans = new Uint32Array(TYPE_NAMES.length * CELL_COUNT * VISION_WORDS);
+    const board = { map };
+    const maxVision = Math.max(...TYPE_NAMES.map(type => UNIT_DEFS[type].vision));
+
+    for (let from = 0; from < CELL_COUNT; from++) {
+      const x = from % BOARD_SIZE;
+      const y = Math.floor(from / BOARD_SIZE);
+      const cell = map[y][x];
+      terrain[from] = cell.terrain === 'forest' ? 2 : cell.elev;
+      for (const [direction, { dx, dy }] of DIRS.entries()) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (!inBounds(nx, ny)) continue;
+        const edge = from * DIRS.length + direction;
+        neighbors[edge] = cellIndex(nx, ny);
+        costs[edge] = getMoveStepCost(x, y, nx, ny, board);
+      }
+      for (let to = 0; to < CELL_COUNT; to++) {
+        const tx = to % BOARD_SIZE;
+        const ty = Math.floor(to / BOARD_SIZE);
+        distance[from * CELL_COUNT + to] = manhattan(x, y, tx, ty);
+        const euclid = Math.hypot(tx - x, ty - y);
+        if (euclid > maxVision + cell.elev + 0.5 || (map[ty][tx].terrain === 'forest' && euclid > 2.05)
+            || !hasLineOfSight(x, y, tx, ty, cell.elev, board)) continue;
+        for (const [type, name] of TYPE_NAMES.entries()) {
+          if (euclid <= UNIT_DEFS[name].vision + cell.elev + 0.5) {
+            const offset = (type * CELL_COUNT + from) * VISION_WORDS;
+            scans[offset + (to >>> 5)] |= 1 << (to & 31);
+          }
+        }
+      }
+    }
+    const geometry = { terrain, neighbors, costs, distance, scans };
+    advancedGeometry.set(map, geometry);
+    return geometry;
+  }
+
+  function createBlueBeliefs() {
+    return INITIAL_BLUE_UNITS.map(({ x, y }) => {
+      const probability = new Float32Array(CELL_COUNT);
+      probability[cellIndex(x, y)] = 1;
+      return probability;
+    });
+  }
+
+  function redKnowledgeOfBlue(vision) {
+    const seen = new Int16Array(BLUE_SLOTS).fill(-1);
+    const blocked = new Uint8Array(CELL_COUNT);
+    const redPositions = [];
+    for (const id of vision.detectedEnemyIds) {
+      const unit = getUnitById(id);
+      const cell = cellIndex(unit.x, unit.y);
+      seen[Number(id.slice(1)) - 1] = cell;
+      blocked[cell] = 1;
+    }
+    for (const unit of state.units) {
+      if (unit.faction === 'red' && unit.alive) {
+        const cell = cellIndex(unit.x, unit.y);
+        blocked[cell] = 1;
+        redPositions.push({ cell, shield: unit.type === 'shield' });
+      }
+    }
+    for (let cell = 0; cell < CELL_COUNT; cell++) {
+      if (isTileScanned(cell % BOARD_SIZE, Math.floor(cell / BOARD_SIZE), vision, state.map)) blocked[cell] = 1;
+    }
+    return { seen, blocked, redPositions };
+  }
+
+  function filterBlueBeliefs(knowledge) {
+    const { seen, blocked } = knowledge;
+    for (const [slot, row] of state.aiBelief.entries()) {
+      const entry = state.aiMemory.redKnowledge['B' + (slot + 1)];
+      if (!entry.alive || seen[slot] >= 0) {
+        row.fill(0);
+        if (entry.alive) row[seen[slot]] = 1;
+        continue;
+      }
+
+      let total = 0;
+      for (let cell = 0; cell < CELL_COUNT; cell++) {
+        if (blocked[cell]) row[cell] = 0;
+        total += row[cell];
+      }
+      if (total === 0) {
+        const anchor = entry.lastX === null ? INITIAL_BLUE_UNITS[slot] : { x: entry.lastX, y: entry.lastY };
+        for (let cell = 0; cell < CELL_COUNT; cell++) {
+          if (blocked[cell]) continue;
+          const distance = manhattan(cell % BOARD_SIZE, Math.floor(cell / BOARD_SIZE), anchor.x, anchor.y);
+          row[cell] = 1 / (1 + distance * distance);
+          total += row[cell];
+        }
+      }
+      if (total > 0) {
+        for (let cell = 0; cell < CELL_COUNT; cell++) row[cell] /= total;
+      }
+    }
+  }
+
+  function beliefDestinations(start, mp, geometry, redOccupied, redZoC) {
+    const cost = new Uint8Array(CELL_COUNT).fill(255);
+    const queue = Array.from({ length: mp + 1 }, () => []);
+    const destinations = [];
+    cost[start] = 0;
+    queue[0].push(start);
+    for (let spent = 0; spent <= mp; spent++) {
+      for (const cell of queue[spent]) {
+        if (cost[cell] !== spent) continue;
+        if (cell !== start) {
+          destinations.push(cell);
+          if (redZoC[cell]) continue;
+        }
+        for (let edge = cell * 4; edge < cell * 4 + 4; edge++) {
+          const next = geometry.neighbors[edge];
+          if (next < 0 || redOccupied[next]) continue;
+          const price = spent + geometry.costs[edge] + (cell === start ? redZoC[start] : 0);
+          if (price <= mp && price < cost[next]) {
+            cost[next] = price;
+            queue[price].push(next);
+          }
+        }
+      }
+    }
+    return destinations;
+  }
+
+  function advanceBlueBeliefs() {
+    const knowledge = redKnowledgeOfBlue(state.visionByFaction.red);
+    const { seen, redPositions } = knowledge;
+    const observation = state.observedBlueAction;
+    const geometry = advancedGeometryFor(state.map);
+    const redOccupied = new Uint8Array(CELL_COUNT);
+    const redZoC = new Uint8Array(CELL_COUNT);
+    const observedBlueCells = new Set(seen);
+    for (const { cell, shield } of redPositions) {
+      redOccupied[cell] = 1;
+      if (!shield) continue;
+      for (let edge = cell * 4; edge < cell * 4 + 4; edge++) {
+        const next = geometry.neighbors[edge];
+        if (next >= 0) redZoC[next] = 1;
+      }
+    }
+    const hiddenLiving = state.aiBelief.filter((_, slot) =>
+      seen[slot] < 0 && state.aiMemory.redKnowledge['B' + (slot + 1)].alive).length;
+
+    for (const [slot, row] of state.aiBelief.entries()) {
+      const entry = state.aiMemory.redKnowledge['B' + (slot + 1)];
+      if (!entry.alive || seen[slot] >= 0 || (observation && observation.id !== entry.id)) continue;
+      const movingProbability = observation ? 1 : 0.88 / Math.max(1, hiddenLiving);
+      const prior = new Float32Array(CELL_COUNT);
+      if (observation) prior[observation.cell] = 1;
+      else prior.set(row);
+      row.fill(0);
+      const mp = UNIT_DEFS[entry.type].mp;
+      for (let from = 0; from < CELL_COUNT; from++) {
+        if (!prior[from]) continue;
+        const destinations = beliefDestinations(from, mp, geometry, redOccupied, redZoC)
+          .filter(cell => !observedBlueCells.has(cell));
+        // 未見行動時，所有棋子分攤至多一枚移動的機率；其餘機率留在原格。
+        row[from] += destinations.length ? prior[from] * (1 - movingProbability) : prior[from];
+        if (destinations.length) {
+          const share = prior[from] * movingProbability / destinations.length;
+          for (const cell of destinations) row[cell] += share;
+        }
+      }
+    }
+
+    state.observedBlueAction = null;
+    filterBlueBeliefs(knowledge);
+  }
+
+  function observeBlueAction(unitId, x, y) {
+    if (state.aiBelief && state.activeFaction === 'blue') {
+      state.observedBlueAction = { id: unitId, cell: cellIndex(x, y) };
+    }
+  }
 
   function createTerrainGrid() {
     const grid = [];
@@ -1304,6 +1503,7 @@
   }
 
   function initGame(mode = currentMode, difficulty = currentDifficulty) {
+    cancelAdvancedAiSearch();
     if (aiTimer !== null) {
       clearTimeout(aiTimer);
       aiTimer = null;
@@ -1331,6 +1531,12 @@
       lastSeen: { blue: {}, red: {} },
       visionByFaction: { blue: null, red: null },
       aiMemory: createAiMemory(),
+      aiBelief: isPvE() && isWorkerDifficulty(difficulty) ? createBlueBeliefs() : null,
+      observedBlueAction: null,
+      publicRedForce: {
+        units: INITIAL_BLUE_UNITS.length,
+        hp: INITIAL_BLUE_UNITS.reduce((total, entry) => total + UNIT_DEFS[entry.type].maxHp, 0)
+      },
       lastEnemyVisual: null,
       aiTurnSummary: '',
       turnNotice: '',
@@ -1526,6 +1732,7 @@
     updateLastSeenFor('blue', bv);
     updateLastSeenFor('red', rv);
     if (isPvE()) updateAiMemoryFromRedVision(rv);
+    if (state.aiBelief && state.activeFaction === 'red') filterBlueBeliefs(redKnowledgeOfBlue(rv));
   }
 
   /**
@@ -1948,9 +2155,15 @@
         break;
       }
 
+      const visibleDeparture = actorFaction === 'blue' && state.aiBelief
+        && state.visionByFaction.red.detectedEnemyIds.has(unit.id);
+      if (visibleDeparture) observeBlueAction(unit.id, unit.x, unit.y);
       unit.x = next.x;
       unit.y = next.y;
       recomputeAllVisions();
+      if (actorFaction === 'blue' && state.aiBelief && state.visionByFaction.red.detectedEnemyIds.has(unit.id)) {
+        observeBlueAction(unit.id, unit.x, unit.y);
+      }
 
       if (state.visionByFaction[observer].detectedEnemyIds.has(unit.id)) {
         visibleTrailKeys.add(keyOf(unit.x, unit.y));
@@ -2070,6 +2283,18 @@
     }
   }
 
+  function applyCombatDamage(unit, damage) {
+    const lostHp = Math.min(unit.hp, damage);
+    unit.hp -= lostHp;
+    unit.alive = unit.hp > 0;
+    if (unit.faction === 'red') {
+      state.publicRedForce.hp -= lostHp;
+      if (!unit.alive) state.publicRedForce.units--;
+    }
+    if (!unit.alive) recordConfirmedCasualty(unit);
+    return lostHp;
+  }
+
   function resolveCombat(attacker, target, chargeDisp, isStandingAttack) {
     const result = previewCombat(attacker, target, chargeDisp, state);
     const attackerObserved = state.visionByFaction[target.faction].detectedEnemyIds.has(attacker.id);
@@ -2078,26 +2303,23 @@
     const attackLabel = isStandingAttack ? '原地攻擊' : '移動攻擊';
     const viewers = ['blue', 'red'];
 
-    target.hp = Math.max(0, target.hp - result.damage);
-    target.alive = target.hp > 0;
+    if (attacker.faction === 'blue' && attackerObserved) observeBlueAction(attacker.id, attacker.x, attacker.y);
+    const defenderLoss = applyCombatDamage(target, result.damage);
     state.turnsSinceDamage = 0;
     state.damageThisTurn = true;
-    addFloatEffect(target.x, target.y, result.isShattered ? `破盾 -${result.damage}` : `-${result.damage}`,
+    addFloatEffect(target.x, target.y, result.isShattered ? `破盾 -${defenderLoss}` : `-${defenderLoss}`,
       result.isShattered ? '#fbbf24' : '#ef4444', viewers);
 
-    let outcome = `${defenderName}(${target.x},${target.y})${result.isShattered ? '【破盾衝散⚡】' : ''}，造成 ${result.damage} 傷（剩 ${target.hp}/${target.maxHp}）。`;
+    let outcome = `${defenderName}(${target.x},${target.y})${result.isShattered ? '【破盾衝散⚡】' : ''}，造成 ${defenderLoss} 傷（剩 ${target.hp}/${target.maxHp}）。`;
     let counterText = '';
     if (!target.alive) {
-      recordConfirmedCasualty(target);
       outcome += ` ${defenderName}陣亡！`;
     } else if (result.canCounter) {
-      attacker.hp = Math.max(0, attacker.hp - result.counterDamage);
-      attacker.alive = attacker.hp > 0;
-      addFloatEffect(attacker.x, attacker.y, result.counterDamage > 0 ? `反擊 -${result.counterDamage}` : '反擊 0',
+      const attackerLoss = applyCombatDamage(attacker, result.counterDamage);
+      addFloatEffect(attacker.x, attacker.y, attackerLoss > 0 ? `反擊 -${attackerLoss}` : '反擊 0',
         '#facc15', attackerObserved ? viewers : [attacker.faction]);
-      counterText = ` ${defenderName}反擊 ${result.counterDamage} 傷（攻方剩 ${attacker.hp}/${attacker.maxHp}）。`;
+      counterText = ` ${defenderName}反擊 ${attackerLoss} 傷（攻方剩 ${attacker.hp}/${attacker.maxHp}）。`;
       if (!attacker.alive) {
-        recordConfirmedCasualty(attacker);
         counterText += ` ${attackerName}陣亡！`;
       }
     }
@@ -2193,6 +2415,7 @@
   }
 
   function triggerGameOver(winner, reason) {
+    cancelAdvancedAiSearch();
     if (aiTimer) {
       clearTimeout(aiTimer);
       aiTimer = null;
@@ -2219,6 +2442,7 @@
     state.turn += 1;
     state.turnsSinceDamage = state.damageThisTurn ? 0 : state.turnsSinceDamage + 1;
     state.damageThisTurn = false;
+    if (state.aiBelief && state.activeFaction === 'blue') advanceBlueBeliefs();
     state.activeFaction = opponentOf(state.activeFaction);
     state.phase = 'SELECT_OR_ACT';
     state.selectedUnitId = null;
@@ -2329,8 +2553,9 @@
       redVision: state.visionByFaction.red,
       turn: state.turn,
       flankBias: state.aiMemory.flankBias,
-      memory: difficulty === 'warrior' ? state.aiMemory : null,
-      turnsSinceDamage: difficulty === 'warrior' ? state.turnsSinceDamage : 0
+      beliefs: isWorkerDifficulty(difficulty) ? state.aiBelief : null,
+      memory: difficulty === 'recruit' ? null : state.aiMemory,
+      turnsSinceDamage: difficulty === 'recruit' ? 0 : state.turnsSinceDamage
     };
   }
 
@@ -2956,13 +3181,1019 @@
   }
 
   /**
-   * 執行紅方 AI 回合，並依藍方看到的動態留下戰報與軌跡。
+   * 這個搜尋函式也在內嵌 Worker 內執行，僅接收紅方觀測與候選。
+   * 世界盤面只配置一次；遞迴時以落子／還原修改扁平陣列。
    */
-  function runRedAiTurn() {
-    if (state.phase === 'GAME_OVER' || state.activeFaction !== 'red' || !isPvE()) return;
+  function* searchAdvancedAi(packet, emit, options = {}) {
+    const {
+      size, maxTurns, blueSlots, slotTypes, definitions, geometry, estimatedHp, beliefs,
+      knownPositions, scanned, turn, difficulty, seed, roots
+    } = packet;
+    const { terrain, neighbors, costs, distance, scans } = geometry;
+    const count = size * size;
+    const words = Math.ceil(count / 32);
+    const units = slotTypes.length;
+    const flagType = 0;
+    const shieldType = 1;
+    const spearType = 2;
+    const archerType = 3;
+    const cavalryType = 4;
+    const hill = 1;
+    const forest = 2;
+    const flag = [slotTypes.indexOf(flagType), slotTypes.lastIndexOf(flagType)];
+    const marshal = difficulty === 'marshal';
+    const now = options.clock || (() => typeof performance === 'object' ? performance.now() : Date.now());
+    const sliceMs = options.sliceMs || Infinity;
+    const startTime = now();
+    const deadline = startTime + options.budget;
+    let stageDeadline = deadline;
+    let sliceDeadline = startTime + sliceMs;
+    const timeout = {};
+    const WIN = 100000;
+    const INF = 1000000;
+    let nodes = 0;
+
+    let randomState = seed >>> 0 || 0x72b31d85;
+    function nextRandom() {
+      randomState ^= randomState << 13;
+      randomState ^= randomState >>> 17;
+      randomState ^= randomState << 5;
+      return randomState >>> 0;
+    }
+    const random = () => nextRandom() / 4294967296;
+    const team = slot => Number(slot >= blueSlots);
+    const hasBit = (bits, cell) => (bits[cell >>> 5] & (1 << (cell & 31))) !== 0;
+    const rangeBetween = (a, b) => distance[a * count + b];
+    const scanStart = (slot, cell) => (slotTypes[slot] * count + cell) * words;
+
+    const hpScale = Math.max(...definitions.map(item => item.maxHp)) + 1;
+    const locationKeys = new Uint32Array(units * count * hpScale);
+    const turnKeys = new Uint32Array(maxTurns + 20);
+    for (let i = 0; i < locationKeys.length; i++) locationKeys[i] = nextRandom();
+    for (let i = 0; i < turnKeys.length; i++) turnKeys[i] = nextRandom();
+    const pieceKey = (id, cell, hp) => locationKeys[(id * count + cell) * hpScale + hp];
+
+    const TABLE_MASK = (1 << 16) - 1;
+    const tableKeys = new Uint32Array(TABLE_MASK + 1);
+    const tableDepth = new Int8Array(TABLE_MASK + 1).fill(-1);
+    const tableValue = new Float32Array(TABLE_MASK + 1);
+    const tableBounds = new Uint8Array(TABLE_MASK + 1);
+    const tableFirst = new Int32Array(TABLE_MASK + 1).fill(-1);
+    const frames = Array.from({ length: 20 }, () => ({}));
+    const priorSeen = new Uint32Array(words);
+    const living = estimatedHp.reduce((total, hp) => total + Number(hp > 0), 0);
+    const frontierSize = (1 + Math.max(...definitions.map(type => type.mp))) ** 2;
+    const frontierHead = new Int16Array(frontierSize);
+    const frontierTail = new Int16Array(frontierSize);
+    const queuedCells = new Int16Array(count * 5);
+    const queuedNext = new Int16Array(queuedCells.length);
+    const bestRoute = new Int16Array(count);
+    const routeParent = new Int16Array(count);
+    const destinations = new Int16Array(count);
+    const route = [];
+    const staticKeys = new Uint32Array(TABLE_MASK + 1);
+    const staticValues = new Float32Array(TABLE_MASK + 1);
+    const staticValid = new Uint8Array(TABLE_MASK + 1);
+
+    function* checkpoint() {
+      const elapsed = now();
+      if (elapsed >= stageDeadline) throw timeout;
+      if (elapsed >= sliceDeadline) {
+        yield;
+        sliceDeadline = now() + sliceMs;
+        if (now() >= stageDeadline) throw timeout;
+      }
+    }
+
+    function sampleWorlds(number) {
+      const worlds = new Map();
+      const hidden = [];
+      const free = [];
+      const used = new Uint8Array(count);
+      for (let slot = 0; slot < units; slot++) {
+        if (knownPositions[slot] >= 0) used[knownPositions[slot]] = 1;
+        else if (slot < blueSlots && estimatedHp[slot] > 0) {
+          let support = 0;
+          for (const p of beliefs[slot]) if (p > 0) support++;
+          hidden.push({ slot, support });
+        }
+      }
+      hidden.sort((a, b) => a.support - b.support || a.slot - b.slot);
+      for (let cell = 0; cell < count; cell++) if (!used[cell] && !hasBit(scanned, cell)) free.push(cell);
+
+      const dangerous = new Float32Array(count);
+      for (let cell = 0; cell < count; cell++) {
+        let nearest = count;
+        for (let slot = blueSlots; slot < units; slot++) {
+          if (knownPositions[slot] >= 0) nearest = Math.min(nearest, rangeBetween(cell, knownPositions[slot]));
+        }
+        dangerous[cell] = 1 + Math.max(0, 6 - nearest) * 0.78 + Number(terrain[cell] === forest) * 1.35;
+      }
+
+      for (let i = 0; i < number; i++) {
+        const position = Int16Array.from(knownPositions);
+        const occupied = Uint8Array.from(used);
+        const worstCase = marshal && i >= number - Math.floor(number / 4);
+        for (const { slot } of hidden) {
+          // 抽取各棋子的邊際機率，同一假想盤面不得疊子。
+          let sum = 0;
+          const row = beliefs[slot];
+          for (const cell of free) {
+            if (!occupied[cell]) sum += row[cell] * (worstCase ? dangerous[cell] : 1);
+          }
+          let cell = -1;
+          if (sum > 0) {
+            let needle = random() * sum;
+            for (const candidate of free) {
+              if (occupied[candidate] || row[candidate] === 0) continue;
+              cell = candidate;
+              needle -= row[candidate] * (worstCase ? dangerous[candidate] : 1);
+              if (needle <= 0) break;
+            }
+          } else {
+            // 已被同世界的棋子佔用時，從仍未證實為空的合法格補足條件分布。
+            const available = free.filter(candidate => !occupied[candidate]);
+            if (available.length) cell = available[Math.floor(random() * available.length)];
+          }
+          position[slot] = cell;
+          if (cell >= 0) occupied[cell] = 1;
+        }
+
+        const key = position.join(',');
+        const existing = worlds.get(key);
+        if (existing) {
+          existing.weight++;
+          continue;
+        }
+        const hp = Int16Array.from(estimatedHp);
+        const cells = new Int16Array(count).fill(-1);
+        let hash = 0;
+        for (let slot = 0; slot < units; slot++) {
+          if (position[slot] < 0) {
+            hp[slot] = 0;
+            continue;
+          }
+          cells[position[slot]] = slot;
+          hash ^= pieceKey(slot, position[slot], hp[slot]);
+        }
+        worlds.set(key, { position, hp, cells, hash, turn, weight: 1 });
+      }
+      return [...worlds.values()];
+    }
+
+    function scanSide(board, side, out) {
+      out.fill(0);
+      const first = side * blueSlots;
+      for (let id = first; id < first + blueSlots; id++) {
+        const cell = board.position[id];
+        if (cell < 0) continue;
+        const start = scanStart(id, cell);
+        for (let word = 0; word < words; word++) out[word] |= scans[start + word];
+      }
+    }
+
+    function sideDetects(board, side, cell) {
+      const first = side * blueSlots;
+      const word = cell >>> 5;
+      const bit = 1 << (cell & 31);
+      for (let id = first; id < first + blueSlots; id++) {
+        const origin = board.position[id];
+        if (origin >= 0 && (scans[scanStart(id, origin) + word] & bit)) return true;
+      }
+      return false;
+    }
+
+    function enemyZoc(board, cell, side, seen = null) {
+      for (let edge = cell * 4; edge < cell * 4 + 4; edge++) {
+        const next = neighbors[edge];
+        if (next < 0) continue;
+        const id = board.cells[next];
+        if (id >= 0 && team(id) !== side && slotTypes[id] === shieldType && (!seen || hasBit(seen, next))) return true;
+      }
+      return false;
+    }
+
+    function strikeInRange(board, actor, target) {
+      const from = board.position[actor];
+      const to = board.position[target];
+      const dist = rangeBetween(from, to);
+      const type = slotTypes[actor];
+      if (type === archerType) return dist >= 2 && dist <= (terrain[from] === hill ? 4 : 3);
+      if (dist === 1) return true;
+      if (type !== spearType || dist !== 2 || (from % size !== to % size && Math.floor(from / size) !== Math.floor(to / size))) return false;
+      const middle = (from + to) / 2;
+      if (terrain[from] !== hill && (terrain[to] === hill || terrain[middle] === hill)) return false;
+      const occupant = board.cells[middle];
+      return occupant < 0 || team(occupant) === team(actor);
+    }
+
+    function aura(board, id) {
+      const sideFlag = flag[team(id)];
+      if (sideFlag === id || board.position[sideFlag] < 0) return 0;
+      return Number(rangeBetween(board.position[id], board.position[sideFlag]) <= 2);
+    }
+
+    function neighborCounts(board, cell, side, exclude = -1) {
+      let allies = 0;
+      let rivals = 0;
+      for (let edge = cell * 4; edge < cell * 4 + 4; edge++) {
+        const adjacent = neighbors[edge];
+        if (adjacent < 0) continue;
+        const id = board.cells[adjacent];
+        if (id < 0 || id === exclude) continue;
+        if (team(id) === side) allies++;
+        else rivals++;
+      }
+      return allies | (rivals << 4);
+    }
+
+    function defense(board, id, adjacent, dist, broken) {
+      const cell = board.position[id];
+      const type = slotTypes[id];
+      return definitions[type].baseDef + aura(board, id) + Math.min(2, adjacent & 15)
+        - ((adjacent >>> 4) >= 2 ? 2 : 0) - (broken ? 3 : 0)
+        + (terrain[cell] === forest ? (dist >= 2 ? 2 : 1) : 0)
+        + (type === shieldType && dist >= 2 ? 2 : 0);
+    }
+
+    function battle(board, actor, target, displacement) {
+      const from = board.position[actor];
+      const to = board.position[target];
+      const dist = rangeBetween(from, to);
+      const actorType = slotTypes[actor];
+      const targetType = slotTypes[target];
+      const elevation = Number(terrain[from] === hill) - Number(terrain[to] === hill);
+      const charge = actorType === cavalryType && displacement >= 3 && terrain[from] !== forest;
+      const broken = charge && targetType === shieldType;
+      const targetAdjacency = neighborCounts(board, to, team(target));
+      const attack = definitions[actorType].baseAtk + aura(board, actor) + elevation
+        + (actorType === spearType && dist === 2 ? -1 : 0)
+        + (actorType === spearType && targetType === cavalryType ? 2 : 0) + (charge ? 2 : 0);
+      const damage = Math.max(1, attack - defense(board, target, targetAdjacency, dist, broken));
+      if (damage >= board.hp[target] || dist !== 1 || (targetAdjacency >>> 4) >= 2 || broken || targetType === archerType) return damage;
+      const counterAttack = definitions[targetType].baseAtk + aura(board, target) - elevation
+        + (targetType === spearType && actorType === cavalryType ? 2 : 0);
+      const counter = Math.max(0, counterAttack - 1 - defense(board, actor, neighborCounts(board, from, team(actor)), 1, false));
+      return damage | (counter << 8);
+    }
+
+    function relocate(board, id, destination) {
+      const previous = board.position[id];
+      if (previous === destination) return;
+      if (previous >= 0) {
+        board.hash ^= pieceKey(id, previous, board.hp[id]);
+        board.cells[previous] = -1;
+      }
+      board.cells[destination] = id;
+      board.position[id] = destination;
+      board.hash ^= pieceKey(id, destination, board.hp[id]);
+    }
+
+    function loseHp(board, id, lost) {
+      if (lost === 0) return;
+      const cell = board.position[id];
+      board.hash ^= pieceKey(id, cell, board.hp[id]);
+      board.hp[id] = Math.max(0, board.hp[id] - lost);
+      if (board.hp[id] > 0) board.hash ^= pieceKey(id, cell, board.hp[id]);
+      else {
+        board.position[id] = -1;
+        board.cells[cell] = -1;
+      }
+    }
+
+    function landing(board, id, path) {
+      const side = team(id);
+      let stop = board.position[id];
+      for (let i = 1; i < path.length; i++) {
+        const next = path[i];
+        const occupant = board.cells[next];
+        if (occupant >= 0 && team(occupant) !== side) return -stop - 2;
+        if (occupant < 0) stop = next;
+        if (enemyZoc(board, next, side)) break;
+      }
+      return stop;
+    }
+
+    function opportunisticTarget(board, id, displacement, seenBefore, reconsider) {
+      const side = team(id);
+      const first = (side ^ 1) * blueSlots;
+      let best = -1;
+      let score = 0;
+      for (let target = first; target < first + blueSlots; target++) {
+        const cell = board.position[target];
+        if (cell < 0 || (!reconsider && hasBit(seenBefore, cell)) || !strikeInRange(board, id, target)
+            || !sideDetects(board, side, cell)) continue;
+        const hit = battle(board, id, target, displacement);
+        const damage = hit & 255;
+        const counter = hit >>> 8;
+        const dying = counter >= board.hp[id];
+        const kills = damage >= board.hp[target];
+        if (slotTypes[id] === flagType && dying) continue;
+        const value = (kills ? (slotTypes[target] === flagType ? WIN : 42) : 0)
+          + Math.min(damage, board.hp[target]) * 8 - counter * 9 - (dying ? 45 : 0);
+        if (value > score) {
+          best = target;
+          score = value;
+        }
+      }
+      return best;
+    }
+
+    function make(board, move, frame, root = false) {
+      frame.hash = board.hash;
+      frame.actor = move.unit;
+      frame.target = -1;
+      board.turn++;
+      if (move.unit < 0) return;
+      const id = move.unit;
+      const side = team(id);
+      const start = board.position[id];
+      frame.start = start;
+      frame.actorHp = board.hp[id];
+
+      const stopped = move.landing ?? landing(board, id, move.path);
+      const ambushed = stopped < 0;
+      const end = ambushed ? -stopped - 2 : stopped;
+      let target = move.target;
+      if (root && !ambushed && move.path.length) scanSide(board, side, priorSeen);
+      relocate(board, id, end);
+      if (ambushed) return;
+      const displacement = rangeBetween(start, end);
+
+      if (root && (target < 0 || !strikeInRange(board, id, target) || !sideDetects(board, side, board.position[target]))) {
+        const reconsider = target >= 0 || (move.path.length > 0 && end !== move.path[move.path.length - 1]);
+        target = move.path.length ? opportunisticTarget(board, id, displacement, priorSeen, reconsider) : -1;
+      }
+      if (target < 0) return;
+
+      frame.target = target;
+      frame.targetCell = board.position[target];
+      frame.targetHp = board.hp[target];
+      const hit = battle(board, id, target, displacement);
+      loseHp(board, target, hit & 255);
+      loseHp(board, id, hit >>> 8);
+    }
+
+    function unmake(board, frame) {
+      board.turn--;
+      board.hash = frame.hash;
+      const id = frame.actor;
+      if (id < 0) return;
+      const current = board.position[id];
+      if (current >= 0) board.cells[current] = -1;
+      board.position[id] = frame.start;
+      board.cells[frame.start] = id;
+      board.hp[id] = frame.actorHp;
+      if (frame.target >= 0) {
+        board.cells[frame.targetCell] = frame.target;
+        board.position[frame.target] = frame.targetCell;
+        board.hp[frame.target] = frame.targetHp;
+      }
+    }
+
+    function attackPriority(board, actor, target, displacement) {
+      const hit = battle(board, actor, target, displacement);
+      const damage = hit & 255;
+      if (damage >= board.hp[target]) return slotTypes[target] === flagType ? 20000 : 10000 + damage;
+      if (slotTypes[actor] === cavalryType && displacement >= 3 && slotTypes[target] === shieldType
+          && terrain[board.position[actor]] !== forest) return 8000 + damage;
+      if ((neighborCounts(board, board.position[target], team(target)) >>> 4) >= 2) return 6000 + damage;
+      return 700 + damage * 12 - (hit >>> 8) * 9;
+    }
+
+    function reachableCells(board, id, seen) {
+      const start = board.position[id];
+      const side = team(id);
+      const mp = definitions[slotTypes[id]].mp;
+      const stepLimit = mp + 1;
+      const leaveZoC = Number(enemyZoc(board, start, side, seen));
+      frontierHead.fill(-1);
+      frontierTail.fill(-1);
+      bestRoute.fill(32767);
+      routeParent.fill(-1);
+      let queued = 0;
+      let found = 0;
+      const enqueue = (priority, cell) => {
+        const tail = frontierTail[priority];
+        queuedCells[queued] = cell;
+        queuedNext[queued] = -1;
+        if (tail >= 0) queuedNext[tail] = queued;
+        else frontierHead[priority] = queued;
+        frontierTail[priority] = queued++;
+      };
+      enqueue(0, start);
+      bestRoute[start] = 0;
+
+      for (let priority = 0; priority < stepLimit * stepLimit; priority++) {
+        const spent = Math.floor(priority / stepLimit);
+        const steps = priority % stepLimit;
+        for (let cursor = frontierHead[priority]; cursor >= 0; cursor = queuedNext[cursor]) {
+          const cell = queuedCells[cursor];
+          if (bestRoute[cell] !== priority) continue;
+          if (cell !== start) {
+            const occupant = board.cells[cell];
+            if (occupant < 0 || team(occupant) !== side) destinations[found++] = cell;
+            if (enemyZoc(board, cell, side, seen)) continue;
+          }
+          for (let edge = cell * 4; edge < cell * 4 + 4; edge++) {
+            const next = neighbors[edge];
+            if (next < 0) continue;
+            const occupant = board.cells[next];
+            if (occupant >= 0 && team(occupant) !== side && hasBit(seen, next)) continue;
+            const price = spent + costs[edge] + (cell === start ? leaveZoC : 0);
+            const rank = price * stepLimit + steps + 1;
+            if (price <= mp && rank < bestRoute[next]) {
+              bestRoute[next] = rank;
+              routeParent[next] = cell;
+              enqueue(rank, next);
+            }
+          }
+        }
+      }
+      return found;
+    }
+
+    const moveKey = move => ((move.unit + 1) * (count + 1) + move.destination + 1) * (units + 1) + move.target + 1;
+
+    function movesFor(board, side, onlyAttacks, limit, firstChoice = -1) {
+      const moves = [];
+      const seen = new Uint32Array(words);
+      scanSide(board, side, seen);
+      const first = side * blueSlots;
+      const enemyFirst = (side ^ 1) * blueSlots;
+      const add = (unit, target, destination, landingCell, rank) => {
+        const key = ((unit + 1) * (count + 1) + destination + 1) * (units + 1) + target + 1;
+        const order = key === firstChoice ? rank + 40000 : rank;
+        if (moves.length === limit && order <= moves[limit - 1].order) return;
+        let index = moves.length;
+        while (index > 0 && moves[index - 1].order < order) index--;
+        moves.splice(index, 0, { unit, target, destination, landing: landingCell, order });
+        if (moves.length > limit) moves.pop();
+      };
+      for (let id = first; id < first + blueSlots; id++) {
+        const origin = board.position[id];
+        if (origin < 0) continue;
+        const type = slotTypes[id];
+        const reach = definitions[type].mp + (type === archerType ? 4 : (type === spearType ? 2 : 1));
+        const enemies = [];
+        for (let target = enemyFirst; target < enemyFirst + blueSlots; target++) {
+          const pos = board.position[target];
+          if (pos >= 0 && rangeBetween(origin, pos) <= reach) enemies.push(target);
+        }
+        if (onlyAttacks && !enemies.length) continue;
+
+        for (const target of enemies) {
+          if (hasBit(seen, board.position[target]) && strikeInRange(board, id, target)) {
+            add(id, target, -1, origin, attackPriority(board, id, target, 0));
+          }
+        }
+        const landed = new Uint8Array(count);
+        const found = reachableCells(board, id, seen);
+        for (let j = 0; j < found; j++) {
+          const destination = destinations[j];
+          route.length = 0;
+          for (let cell = destination; cell >= 0; cell = routeParent[cell]) route.push(cell);
+          route.reverse();
+
+          const stopped = landing(board, id, route);
+          if (stopped < 0 && onlyAttacks) continue;
+          const end = stopped < 0 ? -stopped - 2 : stopped;
+          if (end === origin && !onlyAttacks) continue;
+          const landingKind = stopped < 0 ? 1 : 2;
+          if (landed[end] & landingKind) continue;
+          landed[end] |= landingKind;
+          const forward = (side ? 1 : -1) * (Math.floor(end / size) - Math.floor(origin / size));
+          const quiet = stopped < 0 ? -45 : 8 * forward
+            + (terrain[end] === hill ? (type === archerType ? 55 : 36) : 0)
+            + (terrain[end] === forest && type === flagType ? 18 : 0)
+            - (type === flagType ? Math.max(0, forward) * 11 : 0);
+          if (!onlyAttacks) add(id, -1, destination, stopped, quiet);
+          if (stopped < 0 || !enemies.length) continue;
+
+          const displacement = rangeBetween(origin, end);
+          relocate(board, id, end);
+          for (const target of enemies) {
+            if (strikeInRange(board, id, target) && sideDetects(board, side, board.position[target])) {
+              add(id, target, destination, end, attackPriority(board, id, target, displacement) + quiet * 0.04);
+            }
+          }
+          relocate(board, id, origin);
+        }
+      }
+      if (!onlyAttacks) add(-1, -1, -1, -1, -4);
+      return moves;
+    }
+
+    function terminal(board) {
+      if (board.hp[flag[0]] === 0 || board.hp[flag[1]] === 0) {
+        return (Number(board.hp[flag[1]] > 0) - Number(board.hp[flag[0]] > 0)) * (WIN - board.turn);
+      }
+      if (board.turn <= maxTurns) return null;
+      let hp = 0;
+      let hills = 0;
+      for (let id = 0; id < units; id++) {
+        const pos = board.position[id];
+        if (pos < 0) continue;
+        const sign = team(id) ? 1 : -1;
+        hp += sign * board.hp[id];
+        if (terrain[pos] === hill) hills += sign;
+      }
+      return Math.sign(hp || hills) * (WIN - board.turn);
+    }
+
+    function chargeLanes(board, id, side, cell) {
+      if (slotTypes[id] !== cavalryType) return 0;
+      let threat = 0;
+      for (let direction = 0; direction < 4; direction++) {
+        let to = cell;
+        let fuel = definitions[cavalryType].mp - Number(enemyZoc(board, cell, side));
+        for (let step = 1; step <= 4; step++) {
+          const edge = to * 4 + direction;
+          to = neighbors[edge];
+          if (to < 0) break;
+          fuel -= costs[edge];
+          const occupant = board.cells[to];
+          if (fuel < 0 || (occupant >= 0 && team(occupant) !== side)) break;
+          if (step >= 3 && occupant < 0 && terrain[to] !== forest) {
+            for (let adjacent = to * 4; adjacent < to * 4 + 4; adjacent++) {
+              const next = neighbors[adjacent];
+              if (next < 0) continue;
+              const target = board.cells[next];
+              if (target < 0 || team(target) === side) continue;
+              const type = slotTypes[target];
+              threat = Math.max(threat, type === flagType ? 23 : (type === shieldType || type === archerType ? 15 : 8));
+            }
+          }
+          if (enemyZoc(board, to, side)) break;
+        }
+      }
+      return threat;
+    }
+
+    function evaluate(board, tactical = marshal) {
+      let score = 0;
+      const late = board.turn >= maxTurns - 16;
+      const key = (board.hash ^ (tactical ? 0xec820704 : 0) ^ (late ? 0xcf7a5642 : 0)) >>> 0;
+      const entry = key & TABLE_MASK;
+      if (staticValid[entry] && staticKeys[entry] === key) return staticValues[entry];
+      for (let id = 0; id < units; id++) {
+        const cell = board.position[id];
+        if (cell < 0) continue;
+        const side = team(id);
+        const type = slotTypes[id];
+        const home = side ? Math.floor(cell / size) : size - 1 - Math.floor(cell / size);
+        const signs = side ? 1 : -1;
+        const support = neighborCounts(board, cell, side) & 15;
+        let value = definitions[type].aiValue * (late ? 0.42 : 0.82) + board.hp[id] * (late ? 15 : 8)
+          + Math.min(support, 2) * 3 + aura(board, id) * 4;
+        if (type === flagType) {
+          value += board.hp[id] * 11 + Math.min(support, 2) * 9 - Math.max(0, home - 4) * 5;
+        } else {
+          value += Math.min(home, 6) * (type === cavalryType ? 1.8 : 3.5)
+            + (size / 2 - Math.abs(cell % size - (size - 1) / 2)) * 1.6;
+        }
+        if (terrain[cell] === hill) value += late ? 19 : (type === archerType ? 24 : 11);
+        if (terrain[cell] === forest) value += type === flagType ? 14 : (type === cavalryType ? -3 : 5);
+        if (tactical) {
+          let exposedTargets = 0;
+          const first = (side ^ 1) * blueSlots;
+          for (let target = first; target < first + blueSlots; target++) {
+            if (board.position[target] >= 0 && strikeInRange(board, id, target)
+                && sideDetects(board, side, board.position[target])) exposedTargets++;
+          }
+          if (exposedTargets >= 2) value += 9 + (exposedTargets - 2) * 3;
+          value += chargeLanes(board, id, side, cell);
+        }
+        score += signs * value;
+      }
+      staticValid[entry] = 1;
+      staticKeys[entry] = key;
+      staticValues[entry] = score;
+      return score;
+    }
+
+    function* quiescence(board, side, alpha, beta, remaining, ply, firstReply = true) {
+      if ((++nodes & 15) === 0) yield* checkpoint();
+      const result = terminal(board);
+      if (result !== null) return result;
+      let best = evaluate(board);
+      if (remaining <= 0) return best;
+      if (side === 1) alpha = Math.max(alpha, best);
+      else beta = Math.min(beta, best);
+      if (alpha >= beta) return best;
+
+      const frame = frames[ply];
+      const attacks = movesFor(board, side, true, 4);
+      for (const move of attacks) {
+        // 延伸首步還會檢查一般反擊，後續只延伸斬首與有明顯傷亡的交戰。
+        if (!firstReply && move.order < 735 && slotTypes[move.target] !== flagType) continue;
+        make(board, move, frame);
+        let score;
+        try {
+          score = yield* quiescence(board, side ^ 1, alpha, beta, remaining - 1, ply + 1, false);
+        } finally {
+          unmake(board, frame);
+        }
+        if (side === 1) {
+          best = Math.max(best, score);
+          alpha = Math.max(alpha, best);
+        } else {
+          best = Math.min(best, score);
+          beta = Math.min(beta, best);
+        }
+        if (alpha >= beta) break;
+      }
+      return best;
+    }
+
+    function* alphaBeta(board, side, depth, alpha, beta, ply, extension, fast) {
+      if ((++nodes & 15) === 0) yield* checkpoint();
+      const result = terminal(board);
+      if (result !== null) return result;
+      if (!depth) return extension
+        ? yield* quiescence(board, side, alpha, beta, extension, ply)
+        : evaluate(board, false);
+
+      const originalAlpha = alpha;
+      const originalBeta = beta;
+      const key = (board.hash ^ turnKeys[board.turn] ^ Math.imul(extension, 0x1bcc902f)) >>> 0;
+      const tableIndex = key & TABLE_MASK;
+      let firstChoice = -1;
+      if (marshal && !fast && tableKeys[tableIndex] === key && tableDepth[tableIndex] >= 0) {
+        firstChoice = tableFirst[tableIndex];
+        if (tableDepth[tableIndex] >= depth) {
+          const value = tableValue[tableIndex];
+          if (tableBounds[tableIndex] === 0 || (tableBounds[tableIndex] === 1 && value <= alpha)
+              || (tableBounds[tableIndex] === 2 && value >= beta)) return value;
+        }
+      }
+
+      let best = side === 1 ? -INF : INF;
+      let bestMove = -1;
+      const width = fast ? 3 : (marshal ? (living <= 7 ? 3 : 4) : (depth === 1 ? 5 : 6));
+      const moves = movesFor(board, side, false, width, firstChoice);
+      const frame = frames[ply];
+      for (const move of moves) {
+        make(board, move, frame);
+        let score;
+        try {
+          score = yield* alphaBeta(board, side ^ 1, depth - 1, alpha, beta, ply + 1, extension, fast);
+        } finally {
+          unmake(board, frame);
+        }
+        if (side === 1 ? score > best : score < best) {
+          best = score;
+          bestMove = moveKey(move);
+        }
+        if (side === 1) alpha = Math.max(alpha, best);
+        else beta = Math.min(beta, best);
+        if (alpha >= beta) break;
+      }
+      if (marshal && !fast) {
+        tableKeys[tableIndex] = key;
+        tableDepth[tableIndex] = depth;
+        tableValue[tableIndex] = best;
+        tableBounds[tableIndex] = best <= originalAlpha ? 1 : (best >= originalBeta ? 2 : 0);
+        tableFirst[tableIndex] = bestMove;
+      }
+      return best;
+    }
+
+    const sampled = marshal ? 12 : 4;
+    const worlds = sampleWorlds(sampled);
+    function* rank(pool, depth, extension, fast, forceCheck = false) {
+      const scored = [];
+      for (const move of pool) {
+        let total = 0;
+        let worst = INF;
+        for (const board of worlds) {
+          yield* checkpoint();
+          const frame = frames[0];
+          make(board, move, frame, true);
+          let score;
+          try {
+            score = yield* alphaBeta(board, 0, depth - 1, -INF, INF, 1, extension, fast);
+          } finally {
+            unmake(board, frame);
+          }
+          // 偵察價值與陣形取捨是各世界評估的同一部分，強制勝負優先。
+          const evaluated = Math.abs(score) > WIN - 150 ? score : score + move.bias;
+          total += board.weight * evaluated;
+          worst = Math.min(worst, evaluated);
+        }
+        const average = total / sampled;
+        const score = marshal ? average * 0.7 + worst * 0.3 : average;
+        scored.push({ move, score, forced: forceCheck && worst > WIN - 140 });
+      }
+      scored.sort((a, b) => b.score - a.score || a.move.index - b.move.index);
+      return scored;
+    }
+
+    function guaranteedCapture(move) {
+      if (move.target !== flag[0]) return false;
+      if (!knownPositions.every((cell, slot) => cell >= 0 || estimatedHp[slot] === 0)) {
+        // 若有隱軍，逐格確認路徑、可能攔截的相鄰格與旗手援護範圍。
+        for (const cell of [...move.path, knownPositions[move.target]]) {
+          if (!hasBit(scanned, cell)) return false;
+          for (let edge = cell * 4; edge < cell * 4 + 4; edge++) {
+            const next = neighbors[edge];
+            if (next >= 0 && !hasBit(scanned, next)) return false;
+          }
+        }
+      }
+      return true;
+    }
+
+    const sortedRoots = roots.slice().sort((a, b) => b.order - a.order || a.index - b.index);
+    let best = sortedRoots[0];
+    let completedDepth = 0;
+    let forced = false;
+    const result = () => ({ index: best.index, depth: completedDepth, worlds: sampled, nodes, forced });
+    emit(result());
 
     try {
-      const action = chooseRedAiAction(observeRedTurn(currentDifficulty));
+      const pool = sortedRoots.slice(0, marshal ? 24 : 10);
+      // 戰術搜尋逾時時留用完整比較過的上一層。
+      let ranked = yield* rank(pool, 1, 0, true, true);
+      best = ranked[0].move;
+      completedDepth = 1;
+      forced = ranked[0].forced && guaranteedCapture(best);
+      emit(result());
+      if (forced) return result();
+
+      if (!marshal) {
+        ranked = yield* rank(ranked.map(item => item.move), 2, 0, true);
+        best = ranked[0].move;
+        completedDepth = 2;
+        emit(result());
+        ranked = yield* rank(ranked.map(item => item.move), 3, 1, false);
+        best = ranked[0].move;
+        completedDepth = 3;
+        return result();
+      }
+
+      stageDeadline = Math.min(deadline, startTime + 300);
+      try {
+        ranked = yield* rank(ranked.map(item => item.move), 2, 0, true);
+        best = ranked[0].move;
+        completedDepth = 2;
+        emit(result());
+      } catch (error) {
+        if (error !== timeout) throw error;
+      }
+      stageDeadline = deadline;
+
+      const maxDepth = living <= 5 ? 8 : (living <= 8 || turn >= maxTurns - 16 ? 6 : 5);
+      const extension = living <= 7 ? 5 : 3;
+      ranked = ranked.slice(0, 16);
+      for (let depth = 3; depth <= maxDepth; depth++) {
+        const replyDepth = depth === 3 ? 1 : extension;
+        ranked = yield* rank(ranked.map(item => item.move), depth, replyDepth, false);
+        best = ranked[0].move;
+        completedDepth = depth;
+        emit(result());
+      }
+    } catch (error) {
+      if (error !== timeout) throw error;
+    }
+    return result();
+  }
+
+  function advancedSearchPacket(observation, difficulty, seed) {
+    const ctx = buildAiStrategicContext(observation);
+    const actions = generateRedAiCandidates(ctx);
+    const { board } = observation;
+    const geometry = advancedGeometryFor(board.map);
+    const scanned = new Uint32Array(VISION_WORDS);
+    const knownPositions = new Int16Array(BLUE_SLOTS * 2).fill(-1);
+    const estimatedHp = new Int16Array(knownPositions.length);
+    const slotOf = id => id ? Number(id.slice(1)) - 1 + (id[0] === 'R' ? BLUE_SLOTS : 0) : -1;
+    for (const entry of Object.values(observation.memory.redKnowledge)) {
+      if (entry.alive) estimatedHp[slotOf(entry.id)] = entry.knownHp;
+    }
+    for (const unit of board.units) {
+      const slot = slotOf(unit.id);
+      knownPositions[slot] = cellIndex(unit.x, unit.y);
+      estimatedHp[slot] = unit.hp;
+    }
+    for (let cell = 0; cell < CELL_COUNT; cell++) {
+      if (isTileScanned(cell % BOARD_SIZE, Math.floor(cell / BOARD_SIZE), observation.redVision, board.map)) {
+        scanned[cell >>> 5] |= 1 << (cell & 31);
+      }
+    }
+
+    const information = new Float32Array(CELL_COUNT);
+    const beliefs = observation.beliefs;
+    for (const [slot, row] of beliefs.entries()) {
+      if (knownPositions[slot] >= 0 || !estimatedHp[slot]) continue;
+      const role = INITIAL_BLUE_UNITS[slot].type;
+      const weight = role === 'flag' ? 4.2 : (role === 'archer' ? 2 : 1);
+      for (let cell = 0; cell < CELL_COUNT; cell++) information[cell] += row[cell] * weight;
+    }
+
+    const roots = actions.map((action, index) => {
+      const unit = slotOf(action.unitId);
+      const target = slotOf(action.targetId);
+      const path = action.path ? action.path.map(({ x, y }) => cellIndex(x, y)) : [];
+      const utility = scoreCandidateAction(action, ctx);
+      let informationValue = 0;
+      let priority = 0;
+      if (path.length) {
+        const destination = path[path.length - 1];
+        const type = TYPE_NAMES.indexOf(INITIAL_BLUE_UNITS[unit % BLUE_SLOTS].type);
+        const offset = (type * CELL_COUNT + destination) * VISION_WORDS;
+        for (let cell = 0; cell < CELL_COUNT; cell++) {
+          const word = cell >>> 5;
+          if ((geometry.scans[offset + word] & ~scanned[word] & (1 << (cell & 31))) !== 0) {
+            informationValue += information[cell];
+          }
+        }
+        if (geometry.terrain[destination] === 1) priority += 24;
+      }
+      if (target >= 0) {
+        const attacker = getUnitById(action.unitId, board);
+        const defender = getUnitById(action.targetId, board);
+        const from = { x: attacker.x, y: attacker.y };
+        if (path.length) {
+          attacker.x = action.tx;
+          attacker.y = action.ty;
+        }
+        try {
+          const preview = previewCombat(attacker, defender, action.disp || 0, board);
+          if (!preview.defenderSurvives) priority += defender.type === 'flag' ? 40000 : 1200;
+          else if (preview.isShattered) priority += 900;
+          else if (preview.defRes.isFlanked) priority += 600;
+          else priority += 60;
+        } finally {
+          Object.assign(attacker, from);
+        }
+      }
+      // 旗手受威脅時，把避開斬首線的退路／護衛也列入初篩。
+      if (ctx.stance === 'DEFEND' && ctx.myFlag && unit >= 0) {
+        if (action.unitId === ctx.myFlag.id && path.length) priority += Math.max(0, utility) * 0.9;
+        if (target >= 0 && ctx.visibleEnemies.some(enemy => enemy.id === action.targetId
+            && manhattan(enemy.x, enemy.y, ctx.myFlag.x, ctx.myFlag.y) <= 4)) priority += 110;
+      }
+      return {
+        index, unit, target, path,
+        order: utility + priority + informationValue * 16,
+        bias: Math.max(-18, Math.min(20, utility * 0.18)) + informationValue * 7
+      };
+    });
+    const slotTypes = Int8Array.from({ length: knownPositions.length }, (_, slot) =>
+      TYPE_NAMES.indexOf(INITIAL_BLUE_UNITS[slot % BLUE_SLOTS].type));
+    const definitions = TYPE_NAMES.map(name => {
+      const { maxHp, mp, baseAtk, baseDef, aiValue } = UNIT_DEFS[name];
+      return { maxHp, mp, baseAtk, baseDef, aiValue };
+    });
+    return {
+      actions,
+      payload: {
+        size: BOARD_SIZE, maxTurns: MAX_TURNS, blueSlots: BLUE_SLOTS, turn: observation.turn,
+        slotTypes, definitions, geometry, knownPositions, estimatedHp, scanned, beliefs, roots,
+        difficulty, seed
+      }
+    };
+  }
+
+  function advancedWorkerSource() {
+    return `'use strict';
+      ${searchAdvancedAi.toString()}
+      self.onmessage = ({ data: { id, payload, budget } }) => {
+        const emit = value => self.postMessage({ id, kind: 'progress', value });
+        try {
+          const job = searchAdvancedAi(payload, emit, { budget });
+          let step = job.next();
+          while (!step.done) step = job.next();
+          self.postMessage({ id, kind: 'done', value: step.value });
+        } catch {
+          self.postMessage({ id, kind: 'failed' });
+        }
+      };`;
+  }
+
+  function releaseAdvancedWorker(search) {
+    if (search.worker) {
+      search.worker.terminate();
+      search.worker = null;
+    }
+    if (search.workerUrl) {
+      URL.revokeObjectURL(search.workerUrl);
+      search.workerUrl = null;
+    }
+  }
+
+  function cancelAdvancedAiSearch() {
+    const search = activeAiSearch;
+    activeAiSearch = null;
+    if (!search) return;
+    clearTimeout(search.deadlineTimer);
+    clearTimeout(search.nextTimer);
+    releaseAdvancedWorker(search);
+  }
+
+  function startAdvancedAiSearch(observation, difficulty) {
+    const config = DIFFICULTIES[difficulty];
+    const now = () => typeof performance === 'object' ? performance.now() : Date.now();
+    const started = now();
+    const { actions, payload } = advancedSearchPacket(observation, difficulty, (Math.random() * 0xffffffff) >>> 0);
+    const search = {
+      id: ++nextAiSearchId, game: state, turn: state.turn,
+      worker: null, workerUrl: null, nextTimer: null, deadlineTimer: null,
+      best: null, finishing: false, local: false
+    };
+    activeAiSearch = search;
+    const current = () => activeAiSearch === search && state === search.game
+      && state.turn === search.turn && state.activeFaction === 'red' && state.aiThinking;
+    const receive = (value) => {
+      if (!value || !Number.isInteger(value.index) || !actions[value.index]) return;
+      if (!search.best || value.depth >= search.best.depth) search.best = value;
+    };
+    const finish = () => {
+      if (!current() || search.finishing) return;
+      search.finishing = true;
+      clearTimeout(search.nextTimer);
+      clearTimeout(search.deadlineTimer);
+      releaseAdvancedWorker(search);
+      const delay = Math.max(0, config.minTime - (now() - started));
+      search.nextTimer = setTimeout(() => {
+        if (!current()) return;
+        const action = search.best?.depth > 0 ? actions[search.best.index] : chooseRedAiAction(observation);
+        cancelAdvancedAiSearch();
+        executeRedAiAction(action);
+      }, delay);
+    };
+    const runLocally = () => {
+      if (!current() || search.local || search.finishing) return;
+      releaseAdvancedWorker(search);
+      search.local = true;
+      const budget = Math.min(config.budget, config.deadline - (now() - started) - 30);
+      if (budget <= 0) {
+        finish();
+        return;
+      }
+      const job = searchAdvancedAi(payload, receive, { budget, sliceMs: 7 });
+      const resume = () => {
+        if (!current() || search.finishing) return;
+        try {
+          const step = job.next();
+          if (!step.done) search.nextTimer = setTimeout(resume, 0);
+          else {
+            receive(step.value);
+            finish();
+          }
+        } catch {
+          finish();
+        }
+      };
+      search.nextTimer = setTimeout(resume, 0);
+    };
+
+    search.deadlineTimer = setTimeout(finish, Math.max(0, config.deadline - (now() - started)));
+    try {
+      search.workerUrl = URL.createObjectURL(new Blob([advancedWorkerSource()], { type: 'text/javascript' }));
+      search.worker = new Worker(search.workerUrl);
+      search.worker.onmessage = ({ data }) => {
+        if (!current() || search.finishing || data.id !== search.id) return;
+        if (data.kind === 'failed') {
+          runLocally();
+          return;
+        }
+        receive(data.value);
+        if (data.kind === 'done') finish();
+      };
+      search.worker.onerror = event => {
+        event.preventDefault();
+        runLocally();
+      };
+      search.worker.onmessageerror = runLocally;
+      search.worker.postMessage({ id: search.id, payload, budget: config.budget });
+    } catch {
+      runLocally();
+    }
+  }
+
+  function runRedAiTurn() {
+    if (state.phase === 'GAME_OVER' || state.activeFaction !== 'red' || !isPvE()) return;
+    const observation = observeRedTurn(currentDifficulty);
+    if (isWorkerDifficulty(currentDifficulty)) {
+      try {
+        startAdvancedAiSearch(observation, currentDifficulty);
+        return;
+      } catch (error) {
+        cancelAdvancedAiSearch();
+        console.error('高階 AI 搜尋準備失敗', error);
+      }
+    }
+    executeRedAiAction(chooseRedAiAction(observation));
+  }
+
+  /**
+   * 按真實棋盤規則執行紅方計畫，並依藍方看到的動態留下戰報與軌跡。
+   */
+  function executeRedAiAction(action) {
+    if (state.phase === 'GAME_OVER' || state.activeFaction !== 'red' || !isPvE()) return;
+    try {
       state.lastEnemyVisual = null;
       const memory = state.aiMemory;
 
@@ -3087,9 +4318,10 @@
       const isFull = faction === viewer || state.revealAllEndgame;
       const hp = units.reduce((total, unit) => total + unit.hp, 0);
       const hills = units.filter(unit => board.map[unit.y][unit.x].terrain === 'hill').length;
-      document.getElementById(faction === 'blue' ? 'topBlueSummary' : 'topRedSummary').textContent = isFull
-        ? `${name} ${units.length} 子 / HP ${hp}`
-        : `${name} 已見 ${units.length} 子`;
+      const publicTotals = isPvE() && faction === 'red' && !state.revealAllEndgame ? state.publicRedForce : null;
+      const summary = publicTotals ? `紅 ${publicTotals.units} 子 / HP ${publicTotals.hp}`
+        : (isFull ? `${name} ${units.length} 子 / HP ${hp}` : `${name} 已見 ${units.length} 子`);
+      document.getElementById(faction === 'blue' ? 'topBlueSummary' : 'topRedSummary').textContent = summary;
       hillText.push(`${name}${isFull ? '' : '已見'}${hills}`);
     }
     document.getElementById('topHillSummary').textContent = '高地 ' + hillText.join(' · ');
