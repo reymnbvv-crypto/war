@@ -1,0 +1,2521 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>迷霧陣線｜雙人熱座方格戰棋 (Tactical Fog Chess)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&display=swap');
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Noto Sans TC', system-ui, -apple-system, sans-serif;
+      background-color: #0b1120;
+      color: #e2e8f0;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      overflow-x: hidden;
+    }
+
+    /* 10×10 戰術棋盤網格（獨立區塊，保證零遮擋與 1:1 精準對齊） */
+    .board-container {
+      position: relative;
+      width: 100%;
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .board-wrapper {
+      display: grid;
+      grid-template-columns: 22px repeat(10, minmax(0, 1fr));
+      grid-template-rows: 22px repeat(10, minmax(0, 1fr));
+      gap: 2px;
+      background-color: #1e293b;
+      padding: 6px;
+      border-radius: 12px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+      width: 100%;
+      aspect-ratio: 1 / 1;
+    }
+
+    .coord-label {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 700;
+      color: #64748b;
+      pointer-events: none;
+    }
+
+    .tile {
+      position: relative;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: filter 0.1s ease, box-shadow 0.1s ease;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      touch-action: manipulation;
+    }
+
+    /* 強制所有格內子圖層不攔截指標事件，確保整個方格任意像素皆由 .tile 精準承接點擊 */
+    .tile > * {
+      pointer-events: none;
+    }
+
+    .tile:hover {
+      filter: brightness(1.09);
+    }
+
+    .tile.tile-hovered {
+      outline: 2px solid rgba(255, 255, 255, 0.72);
+      outline-offset: -2px;
+      z-index: 6;
+    }
+
+    /* 高對比地形底色 */
+    .terrain-plain-even { background-color: #cfd8c4; }
+    .terrain-plain-odd  { background-color: #c2ccb6; }
+
+    .terrain-hill {
+      background: linear-gradient(145deg, #dfbe89 0%, #b88f53 100%);
+      box-shadow: inset 0 0 0 2px rgba(113, 63, 18, 0.55);
+    }
+
+    .terrain-forest {
+      background: linear-gradient(145deg, #568251 0%, #3d6339 100%);
+      box-shadow: inset 0 0 0 1.5px rgba(20, 48, 22, 0.55);
+    }
+
+    /* 戰爭迷霧遮罩（保持地形輪廓與色差清晰可辨） */
+    .fog-overlay {
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        -45deg,
+        rgba(11, 17, 32, 0.58),
+        rgba(11, 17, 32, 0.58) 5px,
+        rgba(24, 34, 54, 0.66) 5px,
+        rgba(24, 34, 54, 0.66) 10px
+      );
+      z-index: 3;
+    }
+
+    /* 樹林在視線內但歐距 > 2.05（無法偵測林內伏兵） */
+    .forest-conceal-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(11, 17, 32, 0.24);
+      z-index: 3;
+    }
+
+    /* 地形角標 */
+    .terrain-tag {
+      position: absolute;
+      top: 1px;
+      left: 2px;
+      font-size: 9px;
+      font-weight: 800;
+      line-height: 1.05;
+      z-index: 2;
+      white-space: nowrap;
+    }
+
+    .hill-tag {
+      color: #54310a;
+      background: rgba(255, 247, 230, 0.82);
+      padding: 1px 2.5px;
+      border-radius: 3px;
+    }
+
+    .forest-icon {
+      position: absolute;
+      bottom: 1px;
+      right: 2px;
+      font-size: 11px;
+      line-height: 1;
+      opacity: 0.72;
+      z-index: 2;
+      filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4));
+    }
+
+    /* 敵方可見重盾控制區（ZoC）橘紅虛線內框 */
+    .zoc-overlay {
+      position: absolute;
+      inset: 2px;
+      border-radius: 4px;
+      border: 2px dashed rgba(249, 115, 22, 0.88);
+      background: rgba(239, 68, 68, 0.08);
+      z-index: 4;
+    }
+
+    .zoc-corner-tag {
+      position: absolute;
+      bottom: 1px;
+      left: 2px;
+      font-size: 8px;
+      font-weight: 900;
+      color: #ffedd5;
+      background: rgba(194, 65, 12, 0.88);
+      padding: 0 2px;
+      border-radius: 2px;
+      line-height: 1.15;
+      z-index: 5;
+    }
+
+    /* 可移動高亮（藍色） */
+    .tile-reachable::after {
+      content: '';
+      position: absolute;
+      inset: 2px;
+      border-radius: 4px;
+      background: rgba(14, 165, 233, 0.34);
+      border: 2px solid rgba(56, 189, 248, 0.95);
+      pointer-events: none;
+      z-index: 6;
+    }
+
+    /* 輕騎衝鋒可達格高亮（金色） */
+    .tile-charge::after {
+      background: rgba(245, 158, 11, 0.34);
+      border: 2px solid rgba(251, 191, 36, 0.98);
+    }
+
+    .charge-tile-badge {
+      position: absolute;
+      top: 1px;
+      right: 1px;
+      font-size: 10px;
+      font-weight: 900;
+      line-height: 1;
+      color: #451a03;
+      background: #fbbf24;
+      border: 1px solid #fef3c7;
+      border-radius: 3px;
+      padding: 0 2px;
+      z-index: 9;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+    }
+
+    /* 移動路徑預覽圓點與 MP 消耗標記（純 CSS 切換，不重建 DOM） */
+    .tile-path::before {
+      content: '';
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      border-radius: 9999px;
+      background: rgba(255, 255, 255, 0.95);
+      box-shadow: 0 0 6px rgba(14, 165, 233, 0.98);
+      pointer-events: none;
+      z-index: 11;
+    }
+
+    .mp-hover-pill {
+      position: absolute;
+      bottom: 2px;
+      right: 2px;
+      font-size: 9px;
+      font-weight: 900;
+      line-height: 1;
+      padding: 1px 3px;
+      border-radius: 3px;
+      background: rgba(15, 23, 42, 0.9);
+      color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.85);
+      z-index: 12;
+      display: none;
+    }
+
+    .tile.tile-path-end .mp-hover-pill {
+      display: block;
+    }
+
+    /* 可攻擊目標紅框（無論原地直攻或移動後攻擊皆清晰標示） */
+    .tile-attackable::after {
+      content: '';
+      position: absolute;
+      inset: 1px;
+      border-radius: 5px;
+      border: 3px solid #ef4444;
+      background: rgba(239, 68, 68, 0.28);
+      box-shadow: inset 0 0 10px rgba(239, 68, 68, 0.75);
+      animation: pulse-attack 1.05s infinite ease-in-out;
+      pointer-events: none;
+      z-index: 15;
+    }
+
+    @keyframes pulse-attack {
+      0%, 100% { box-shadow: inset 0 0 8px rgba(239, 68, 68, 0.55); border-color: #ef4444; }
+      50% { box-shadow: inset 0 0 16px rgba(248, 113, 113, 0.95); border-color: #fecaca; }
+    }
+
+    /* 棋子本體 */
+    .unit-token {
+      position: relative;
+      width: 84%;
+      height: 84%;
+      border-radius: 7px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 10;
+      box-shadow: 0 3px 6px rgba(0, 0, 0, 0.48);
+      transition: transform 0.12s ease;
+    }
+
+    .unit-blue {
+      background: linear-gradient(160deg, #2563eb 0%, #1d4ed8 100%);
+      border: 2px solid #93c5fd;
+      color: #ffffff;
+    }
+
+    .unit-red {
+      background: linear-gradient(160deg, #dc2626 0%, #b91c1c 100%);
+      border: 2px solid #fca5a5;
+      color: #ffffff;
+    }
+
+    .unit-selected {
+      transform: scale(1.06);
+      box-shadow: 0 0 0 2.5px #facc15, 0 4px 12px rgba(250, 204, 21, 0.7);
+    }
+
+    .unit-char {
+      font-size: clamp(13px, 2.1vw, 19px);
+      font-weight: 900;
+      line-height: 1;
+      margin-bottom: 2px;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+    }
+
+    .hp-bar-wrap {
+      width: 82%;
+      height: 5px;
+      background: rgba(15, 23, 42, 0.78);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+
+    .hp-bar-fill {
+      height: 100%;
+      transition: width 0.25s ease;
+    }
+
+    .hp-num {
+      font-size: 9px;
+      font-weight: 700;
+      line-height: 1;
+      margin-top: 1px;
+      opacity: 0.95;
+    }
+
+    /* 狀態小徽章 */
+    .badge-aura {
+      position: absolute;
+      top: -3px;
+      right: -3px;
+      width: 13px;
+      height: 13px;
+      border-radius: 99px;
+      background: #eab308;
+      color: #422006;
+      font-size: 9px;
+      font-weight: 900;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #fef08a;
+      z-index: 12;
+    }
+
+    .badge-support {
+      position: absolute;
+      top: -3px;
+      left: -3px;
+      padding: 0 3px;
+      height: 13px;
+      border-radius: 4px;
+      background: #0f172a;
+      color: #38bdf8;
+      font-size: 8px;
+      font-weight: 800;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #38bdf8;
+      z-index: 12;
+    }
+
+    .badge-flanked {
+      position: absolute;
+      bottom: -3px;
+      right: -3px;
+      padding: 0 2px;
+      height: 13px;
+      border-radius: 3px;
+      background: #991b1b;
+      color: #fef2f2;
+      font-size: 8px;
+      font-weight: 900;
+      border: 1px solid #fca5a5;
+      z-index: 12;
+    }
+
+    /* 最後目擊殘影 */
+    .ghost-token {
+      position: relative;
+      width: 80%;
+      height: 80%;
+      border-radius: 7px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 7;
+      border: 2px dashed rgba(226, 232, 240, 0.72);
+      opacity: 0.68;
+    }
+    .ghost-blue { background: rgba(37, 99, 235, 0.44); color: #dbeafe; }
+    .ghost-red  { background: rgba(220, 38, 38, 0.44); color: #fee2e2; }
+
+    /* 浮動傷害與狀態特效（絕不阻擋點擊） */
+    .float-fx {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      font-size: 13px;
+      text-shadow: 0 2px 4px #000, 0 0 8px #000;
+      pointer-events: none;
+      z-index: 25;
+      animation: floatUp 1.4s ease-out forwards;
+    }
+
+    @keyframes floatUp {
+      0%   { opacity: 0; transform: translateY(6px) scale(0.85); }
+      18%  { opacity: 1; transform: translateY(-4px) scale(1.1); }
+      80%  { opacity: 1; transform: translateY(-14px) scale(1.0); }
+      100% { opacity: 0; transform: translateY(-22px) scale(0.95); }
+    }
+
+    /* 伏擊閃爍 */
+    .tile-ambush-flash {
+      animation: ambushFlash 0.45s ease-in-out 4;
+    }
+    @keyframes ambushFlash {
+      0%, 100% { box-shadow: inset 0 0 0 3px #f59e0b; }
+      50% { box-shadow: inset 0 0 18px 4px #ef4444; }
+    }
+
+    /* 主行動鍵微脈衝提示 */
+    .btn-ready-pulse {
+      animation: readyPulse 1.4s infinite ease-in-out;
+    }
+    @keyframes readyPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.6); }
+      50% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+    }
+
+    /* 自訂細捲軸 */
+    .thin-scroll::-webkit-scrollbar { width: 6px; }
+    .thin-scroll::-webkit-scrollbar-track { background: #0f172a; border-radius: 4px; }
+    .thin-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+  <!-- 頂部狀態列 -->
+  <header class="bg-slate-900/95 border-b border-slate-800 px-4 py-2.5 sticky top-0 z-30">
+    <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-red-600 flex items-center justify-center font-black text-white shadow">
+          旗
+        </div>
+        <div>
+          <h1 class="text-base sm:text-lg font-black tracking-wide text-slate-100 leading-tight">迷霧陣線｜Tactical Fog Chess</h1>
+          <p class="text-[11px] text-slate-400">10×10 海拔迷霧戰場｜雙人熱座換邊｜斬首旗手即勝</p>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2 sm:gap-2.5 text-xs sm:text-sm">
+        <div id="turnBadge" class="px-3 py-1 rounded-full font-bold bg-slate-800 border border-slate-700 text-slate-200">
+          回合 1 / 80
+        </div>
+        <div id="factionBadge" class="px-3 py-1 rounded-full font-black bg-blue-600 text-white shadow">
+          藍方行動
+        </div>
+        <div id="phaseBadge" class="px-3 py-1 rounded-full font-bold bg-sky-500/20 text-sky-300 border border-sky-500/40">
+          選棋移動／原地直攻
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <button id="btnRules" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-xs font-bold text-slate-200 transition">
+          完整規則
+        </button>
+        <button id="btnRestart" class="px-3 py-1.5 rounded-lg bg-rose-900/60 hover:bg-rose-800/80 border border-rose-700/70 text-xs font-bold text-rose-100 transition">
+          重新開始
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主戰場與右側戰術面板（嚴格分欄，確保零重疊遮擋） -->
+  <main class="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-4 flex flex-col lg:flex-row gap-4 items-start justify-center">
+
+    <!-- 左／中欄：棋盤區域 -->
+    <section class="w-full lg:flex-1 min-w-0 flex flex-col items-center gap-2.5">
+      <!-- 雙方兵力與高地統計列 -->
+      <div class="w-full max-w-[640px] grid grid-cols-2 gap-2 text-xs">
+        <div class="bg-blue-950/55 border border-blue-800/60 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
+          <span class="font-bold text-blue-300">藍方（下／先手）</span>
+          <span id="blueSummary" class="font-mono text-blue-100 font-bold">8子｜HP 80｜高地 0</span>
+        </div>
+        <div class="bg-red-950/55 border border-red-800/60 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
+          <span class="font-bold text-red-300">紅方（上／後手）</span>
+          <span id="redSummary" class="font-mono text-red-100 font-bold">8子｜HP 80｜高地 0</span>
+        </div>
+      </div>
+
+      <!-- 動態戰況提示條 -->
+      <div id="statusBanner" class="w-full max-w-[640px] rounded-lg px-3 py-2 text-xs sm:text-sm font-medium bg-slate-800/95 border border-slate-700 text-slate-200 flex items-center justify-between gap-2">
+        <span id="statusText">請點選一枚己方棋子：藍格移動、金⚡格衝鋒、紅框可直接原地攻擊。</span>
+        <span id="chargeHint" class="hidden px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-xs font-bold shrink-0">⚡ 衝鋒就緒 +2攻</span>
+      </div>
+
+      <!-- 10×10 棋盤容器 -->
+      <div class="board-container">
+        <div id="board" class="board-wrapper" role="grid" aria-label="10×10 戰術方格棋盤"></div>
+      </div>
+
+      <!-- 地形與圖示圖例 -->
+      <div class="w-full max-w-[640px] bg-slate-900/90 border border-slate-800 rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-300">
+        <div class="flex flex-wrap items-center gap-2.5">
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded bg-[#cfd8c4] border border-slate-500"></i>平地(1MP)</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded bg-[#cfab72] border border-amber-800"></i>▲高地(上2MP/視+1)</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded bg-[#4e7849] border border-emerald-950"></i>🌲樹林(2MP/防+1/隱≤2.05)</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded border-2 border-dashed border-orange-500 bg-rose-950/50"></i>敵重盾ZoC</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-slate-400">
+          <span><strong class="text-yellow-400">★</strong>軍旗激勵</span>
+          <span><strong class="text-sky-400">+1/+2</strong>鄰接援護</span>
+          <span><strong class="text-rose-400">夾</strong>遭夾擊</span>
+          <span><strong class="text-amber-300">⚡</strong>衝鋒落點</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右欄：戰術指揮、戰鬥預測、情報檢視、戰報與速查 -->
+    <aside class="w-full lg:w-[390px] xl:w-[410px] shrink-0 flex flex-col gap-3">
+
+      <!-- 回合指揮控制卡 -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 shadow-lg">
+        <div class="flex items-center justify-between mb-2.5">
+          <h2 class="text-sm font-bold text-slate-200">回合指揮面板</h2>
+          <span id="selectedUnitTitle" class="text-xs font-bold text-sky-400">尚未選中棋子</span>
+        </div>
+
+        <!-- 主換邊／不攻擊按鈕（僅於已移動鎖定或行動鎖定時啟用） -->
+        <button id="btnEndTurn" disabled
+          class="w-full px-4 py-3 rounded-xl text-sm font-black transition bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white shadow">
+          結束回合並換邊（空白鍵）
+        </button>
+
+        <!-- 獨立防誤觸「跳過回合」按鈕（置於指揮面板內，絕不覆蓋棋盤） -->
+        <div class="mt-2.5 pt-2.5 border-t border-slate-800/90 flex items-center justify-between gap-2">
+          <p id="actionSubHint" class="text-[11px] text-slate-400 leading-snug flex-1">
+            點己方棋子可同時看藍格移動與紅框原地直攻；一旦移動或攻擊即落子無悔。
+          </p>
+          <button id="btnSkipTurn"
+            class="shrink-0 px-2.5 py-1.5 rounded-lg text-xs font-bold transition bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed">
+            跳過回合
+          </button>
+        </div>
+      </div>
+
+      <!-- 即時戰鬥預覽拆解面板 -->
+      <div id="combatPreviewCard" class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 shadow-lg">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm font-bold text-rose-300">戰鬥預覽拆解</h2>
+          <span id="previewBadge" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-400">待命</span>
+        </div>
+        <div id="combatPreviewBody" class="text-xs text-slate-400 leading-relaxed">
+          選中己方棋子（或移動至敵軍射程內）後，將滑鼠移至紅框標示的敵軍，即會逐項列出攻防加成與預計反擊傷害。
+        </div>
+      </div>
+
+      <!-- 戰場情報檢視卡 -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 shadow-lg">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm font-bold text-slate-200">戰場情報檢視</h2>
+          <span id="inspectCoord" class="text-xs font-mono text-slate-400">游標移至棋盤查看</span>
+        </div>
+        <div id="inspectorBody" class="text-xs text-slate-300 space-y-2">
+          <div class="text-slate-400">懸停或點擊棋盤格與可見單位，檢視地形海拔、林內隱蔽狀態與陣型加成。</div>
+        </div>
+      </div>
+
+      <!-- 戰報紀錄 -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 shadow-lg flex flex-col">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm font-bold text-slate-200">戰報紀錄</h2>
+          <span class="text-[11px] text-slate-500">最新動態在上方</span>
+        </div>
+        <div id="battleLog" class="thin-scroll h-40 overflow-y-auto space-y-1.5 pr-1 text-xs"></div>
+      </div>
+
+      <!-- 可收合簡明規則速查表 -->
+      <details class="bg-slate-900 border border-slate-800 rounded-xl shadow-lg group">
+        <summary class="px-3.5 py-2.5 text-xs font-bold text-slate-200 cursor-pointer flex items-center justify-between list-none hover:bg-slate-800/60 rounded-xl">
+          <span>簡明規則與數值速查（點擊展開／收合）</span>
+          <span class="text-slate-400 group-open:rotate-180 transition-transform">▼</span>
+        </summary>
+        <div class="px-3.5 pb-3.5 pt-1 text-[11px] text-slate-300 space-y-2 border-t border-slate-800/80">
+          <div class="grid grid-cols-1 gap-1 text-slate-400">
+            <div><strong class="text-amber-300">勝負：</strong>斬首敵方旗手立即獲勝；滿 80 回合比存活總 HP → 佔領高地格數 → 平手。</div>
+            <div><strong class="text-sky-300">視野：</strong>高地視+1、可越低地樹林但高地遮蔽後方低地；平地不見高地（距1除外）；林內需歐距 ≤2.05 偵測。</div>
+            <div><strong class="text-orange-300">ZoC：</strong>敵重盾相鄰4格，踏入剩餘MP歸0（仍可攻），回合初在內離開第一步+1MP。</div>
+            <div><strong class="text-emerald-300">陣型：</strong>鄰友防+1(上限+2)、≥2敵夾擊防-2且不可反擊、旗手距1~2友軍攻防+1。</div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-[10px]">
+              <thead>
+                <tr class="bg-slate-800 text-slate-200">
+                  <th class="p-1">兵種</th><th class="p-1">HP</th><th class="p-1">攻/防</th><th class="p-1">MP</th><th class="p-1">射/視</th><th class="p-1">核心特性</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-800 text-slate-300">
+                <tr><td class="p-1 font-bold text-white">旗(×1)</td><td class="p-1">12</td><td class="p-1">4/3</td><td class="p-1">3</td><td class="p-1">1/3</td><td class="p-1">距1~2友攻防+1；亡即敗</td></tr>
+                <tr><td class="p-1 font-bold text-white">盾(×2)</td><td class="p-1">14</td><td class="p-1">4/5</td><td class="p-1">2</td><td class="p-1">1/2</td><td class="p-1">ZoC；受遠程防+2</td></tr>
+                <tr><td class="p-1 font-bold text-white">矛(×2)</td><td class="p-1">10</td><td class="p-1">6/3</td><td class="p-1">3</td><td class="p-1">1~2/2</td><td class="p-1">直線2格(攻-1)；對騎+2</td></tr>
+                <tr><td class="p-1 font-bold text-white">弓(×1)</td><td class="p-1">7</td><td class="p-1">7/1</td><td class="p-1">2</td><td class="p-1">2~3(4)/3</td><td class="p-1">曲射；無近戰/無反擊</td></tr>
+                <tr><td class="p-1 font-bold text-white">騎(×2)</td><td class="p-1">9</td><td class="p-1">5/2</td><td class="p-1">4</td><td class="p-1">1/4</td><td class="p-1">起終曼距≥3且非林攻+2</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </details>
+    </aside>
+  </main>
+
+  <!-- 雙人換邊全屏隱私遮罩（嚴格隔絕雙方視野） -->
+  <div id="handoverModal" class="fixed inset-0 z-50 bg-slate-950 flex items-center justify-center p-4">
+    <div class="max-w-md w-full bg-slate-900 border border-slate-700 rounded-2xl p-6 text-center shadow-2xl">
+      <div id="handoverIcon" class="w-16 h-16 mx-auto mb-4 rounded-2xl bg-blue-600 border-2 border-blue-300 flex items-center justify-center text-3xl font-black text-white shadow-lg">
+        藍
+      </div>
+      <p id="handoverTurnText" class="text-xs font-bold tracking-widest text-slate-400 uppercase mb-1">
+        回合 1 / 80
+      </p>
+      <h2 id="handoverTitle" class="text-2xl font-black text-white mb-2">
+        輪到 藍方 行動
+      </h2>
+      <p class="text-sm text-slate-300 mb-6 leading-relaxed">
+        戰場迷霧已安全遮蔽。請確認上一位玩家已移開視線，接手後點擊下方按鈕開始回合並揭開己方視野。
+      </p>
+      <button id="btnConfirmHandover"
+        class="w-full py-3.5 px-6 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-black text-base shadow-lg transition transform active:scale-95">
+        開始回合（顯示戰場）
+      </button>
+    </div>
+  </div>
+
+  <!-- 完整規則速查彈窗 -->
+  <div id="rulesModal" class="hidden fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4">
+    <div class="max-w-3xl w-full max-h-[88vh] bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+      <div class="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between">
+        <h2 class="text-base sm:text-lg font-black text-white">迷霧陣線｜完整規則與數值手冊</h2>
+        <button id="btnCloseRules" class="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold">關閉</button>
+      </div>
+      <div class="p-4 sm:p-5 overflow-y-auto thin-scroll space-y-4 text-xs sm:text-sm text-slate-300 leading-relaxed">
+        <div>
+          <h3 class="font-bold text-amber-300 mb-1">一、勝負與回合流程（落子無悔）</h3>
+          <ul class="list-disc pl-5 space-y-1">
+            <li><strong>斬首勝利：</strong>擊殺敵方「旗手」立即獲勝。</li>
+            <li><strong>80 回合上限：</strong>雙方各 40 動後仍未分勝負，依序比較：① 存活棋子<strong>總剩餘生命值</strong> → ② 佔領<strong>高地格數</strong> → 平手。</li>
+            <li><strong>單回合操作：</strong>選中己方棋子時，棋盤同時顯示可移動藍格與可直接原地攻擊的紅框敵軍。點擊紅框直接原地攻擊；點擊藍格立即鎖定移動（無悔棋），並更新戰爭迷霧。</li>
+            <li><strong>移動後結算：</strong>若新位置射程內有可見敵軍，可選擇點擊攻擊或「不攻擊，結束回合並換邊」；若無敵軍、觸發伏擊或完成攻擊，行動即鎖定，檢視完新視野後按「結束回合並換邊（空白鍵）」。</li>
+            <li><strong>跳過回合：</strong>獨立於指揮面板右下角，採兩段點擊防誤觸確認，無連續跳過上限。</li>
+          </ul>
+        </div>
+
+        <div>
+          <h3 class="font-bold text-sky-300 mb-1">二、地形、海拔與射線視野</h3>
+          <ul class="list-disc pl-5 space-y-1">
+            <li><strong>平地（海拔 0）：</strong>1 MP，無加成。平地看不到高地（除非曼哈頓距離 = 1 仰望崖邊），遇高地或樹林即遮蔽後方所有格。</li>
+            <li><strong>高地（海拔 1）：</strong>平地→高地 2 MP，高地→高地/平地 1 MP。高地上視野半徑 +1、高打低攻 +1、低打高攻 -1、弓手射程 2～4。高地視線可越過低地樹林，但經過另一座高地時會遮蔽其後方低地。</li>
+            <li><strong>樹林（海拔 0）：</strong>2 MP，守方防 +1（受距離 ≥2 遠程攻擊再 +1，共 +2）。林內敵軍無論觀察者海拔皆需歐幾里得距離 ≤ 2.05 且無遮蔽才現形。</li>
+            <li><strong>最後目擊殘影：</strong>敵軍移出視野時於原處留殘影並計數，直到該格進入有效偵察視野確認為空（樹林需歐距 ≤ 2.05）或該單位於他處現形／陣亡。</li>
+          </ul>
+        </div>
+
+        <div>
+          <h3 class="font-bold text-orange-300 mb-1">三、控制區（ZoC）與迷霧伏擊</h3>
+          <ul class="list-disc pl-5 space-y-1">
+            <li><strong>踏入即停：</strong>敵方重盾上下左右 4 格為其控制區。踏入即令剩餘移動力歸 0（停在該格，仍可攻擊）。</li>
+            <li><strong>脫離懲罰：</strong>回合開始時已處於敵方重盾控制區內，離開起始格第一步需額外 +1 MP。</li>
+            <li><strong>伏擊中斷：</strong>路徑若撞上迷霧中隱藏敵軍，強制停在前一格、揭露該敵人並立即鎖定回合結束（不可攻擊）；若踏入隱藏敵方重盾控制區，則停在該格揭露重盾，移動中止但仍可攻擊。</li>
+          </ul>
+        </div>
+
+        <div>
+          <h3 class="font-bold text-emerald-300 mb-1">四、布陣與戰鬥結算公式</h3>
+          <ul class="list-disc pl-5 space-y-1">
+            <li><strong>鄰接援護：</strong>守方上下左右每相鄰 1 名友軍，防禦 +1（上限 +2）。</li>
+            <li><strong>夾擊破防：</strong>守方上下左右存在 ≥2 名敵軍時，防禦 -2 且本次無法反擊。</li>
+            <li><strong>軍旗激勵：</strong>己方旗手曼哈頓距離 1～2 格內友軍（不含旗手本人）攻 +1、防 +1。</li>
+            <li><strong>傷害公式：</strong><code>攻擊傷害 = max(1, 攻方有效攻 - 守方有效防)</code></li>
+            <li><strong>反擊傷害：</strong>守方存活、距離 1 近戰、未被夾擊且非弓手時觸發，<code>反擊傷害 = max(0, 守方有效攻 - 1 - 攻方有效防)</code>（衝鋒不套用於反擊，長矛反騎槍陣套用於反擊）。</li>
+          </ul>
+        </div>
+
+        <div>
+          <h3 class="font-bold text-rose-300 mb-1.5">五、兵種數值表（每方 8 枚）</h3>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr class="bg-slate-800 text-slate-200 border-b border-slate-700">
+                  <th class="p-2">兵種</th>
+                  <th class="p-2">HP</th>
+                  <th class="p-2">攻</th>
+                  <th class="p-2">防</th>
+                  <th class="p-2">MP</th>
+                  <th class="p-2">射程</th>
+                  <th class="p-2">視野</th>
+                  <th class="p-2">專屬特性</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-800">
+                <tr><td class="p-2 font-bold text-white">旗手 (×1)</td><td class="p-2">12</td><td class="p-2">4</td><td class="p-2">3</td><td class="p-2">3</td><td class="p-2">1</td><td class="p-2">3</td><td class="p-2">距 1～2 友軍攻防 +1；陣亡立即敗北</td></tr>
+                <tr><td class="p-2 font-bold text-white">重盾 (×2)</td><td class="p-2">14</td><td class="p-2">4</td><td class="p-2">5</td><td class="p-2">2</td><td class="p-2">1</td><td class="p-2">2</td><td class="p-2">控制區（ZoC）；受距 ≥2 遠程攻擊防 +2</td></tr>
+                <tr><td class="p-2 font-bold text-white">長矛 (×2)</td><td class="p-2">10</td><td class="p-2">6</td><td class="p-2">3</td><td class="p-2">3</td><td class="p-2">1~2直線</td><td class="p-2">2</td><td class="p-2">可越友軍攻直線 2 格（攻 -1，平地不可高打/隔高）；對輕騎攻 +2</td></tr>
+                <tr><td class="p-2 font-bold text-white">弓手 (×1)</td><td class="p-2">7</td><td class="p-2">7</td><td class="p-2">1</td><td class="p-2">2</td><td class="p-2">2~3(高4)</td><td class="p-2">3</td><td class="p-2">曲射共享視野；無法攻距 1、無法近戰反擊</td></tr>
+                <tr><td class="p-2 font-bold text-white">輕騎 (×2)</td><td class="p-2">9</td><td class="p-2">5</td><td class="p-2">2</td><td class="p-2">4</td><td class="p-2">1</td><td class="p-2">4</td><td class="p-2">衝鋒：起終點曼哈頓距離 ≥3 且終點非樹林時攻 +2（無後退）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 重新開始確認彈窗（絕不使用 confirm） -->
+  <div id="restartModal" class="hidden fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="max-w-sm w-full bg-slate-900 border border-slate-700 rounded-2xl p-5 shadow-2xl text-center">
+      <h3 class="text-lg font-black text-white mb-2">確定要重新開始對局？</h3>
+      <p class="text-xs text-slate-400 mb-5">目前戰況與戰報將會清空，戰場重置為回合 1 / 80 藍方先手。</p>
+      <div class="grid grid-cols-2 gap-3">
+        <button id="btnCancelRestart" class="py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-bold">取消</button>
+        <button id="btnConfirmRestart" class="py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold">確定重置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 勝負結算彈窗 -->
+  <div id="victoryModal" class="hidden fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="max-w-md w-full bg-slate-900 border border-slate-700 rounded-2xl p-6 text-center shadow-2xl">
+      <div id="victoryBadge" class="w-16 h-16 mx-auto mb-3 rounded-2xl flex items-center justify-center text-3xl font-black text-white shadow-lg">
+        勝
+      </div>
+      <h2 id="victoryTitle" class="text-2xl font-black text-white mb-1">藍方獲勝！</h2>
+      <p id="victoryReason" class="text-sm text-amber-300 font-bold mb-4">成功斬首敵方旗手</p>
+      <div id="victoryStats" class="bg-slate-950/75 border border-slate-800 rounded-xl p-3 mb-5 text-xs text-slate-300 space-y-1.5 text-left"></div>
+      <div class="grid grid-cols-2 gap-3">
+        <button id="btnInspectEndBoard" class="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-100 text-sm font-bold">
+          檢視全圖（除迷霧）
+        </button>
+        <button id="btnPlayAgain" class="py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold">
+          再來一局
+        </button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =========================================================
+   * 一、核心常數、180°對稱地圖配置與兵種定義
+   * ========================================================= */
+  const BOARD_SIZE = 10; // col: 0..9, row: 0..9
+  const MAX_TURNS = 80;
+  const DIRS = [
+    { dx: 0, dy: -1 },
+    { dx: 0, dy: 1 },
+    { dx: -1, dy: 0 },
+    { dx: 1, dy: 0 }
+  ];
+
+  // 180 度中心旋轉對稱地形（皆位於 row 2..7，保證雙方開局單位皆在平地）
+  const HILL_COORDS = [
+    [4, 4], [5, 4], [4, 5], [5, 5], // 中央 2×2 高地山脊
+    [1, 4], [2, 4],                 // 左側高地前哨
+    [8, 5], [7, 5]                  // 右側高地前哨（對稱）
+  ];
+
+  const FOREST_COORDS = [
+    [2, 2], [3, 2], [2, 3],         // 左上樹林帶
+    [7, 7], [6, 7], [7, 6],         // 右下樹林帶（對稱）
+    [7, 3], [8, 3], [6, 4],         // 右中樹林伏擊點
+    [2, 6], [1, 6], [3, 5]          // 左中樹林伏擊點（對稱）
+  ];
+
+  // 五種兵種數值表
+  const UNIT_DEFS = {
+    flag: {
+      name: '旗手', char: '旗', maxHp: 12, baseAtk: 4, baseDef: 3, mp: 3, vision: 3,
+      rangeDesc: '1 格',
+      traitDesc: '軍旗激勵（周圍曼距 1～2 格友軍攻+1、防+1）；陣亡立即敗北。'
+    },
+    shield: {
+      name: '重盾步兵', char: '盾', maxHp: 14, baseAtk: 4, baseDef: 5, mp: 2, vision: 2,
+      rangeDesc: '1 格',
+      traitDesc: '控制區 ZoC（相鄰 4 格踏入即停、離開 +1MP）；盾牌格擋（受距 ≥2 遠程防+2）。'
+    },
+    spear: {
+      name: '長矛兵', char: '矛', maxHp: 10, baseAtk: 6, baseDef: 3, mp: 3, vision: 2,
+      rangeDesc: '1～2 格直線',
+      traitDesc: '長柄突刺（可越友軍攻直線 2 格，距2攻-1，不可平地高打或隔高）；反騎槍陣（對輕騎攻+2，進攻反擊皆有效）。'
+    },
+    archer: {
+      name: '弓手', char: '弓', maxHp: 7, baseAtk: 7, baseDef: 1, mp: 2, vision: 3,
+      rangeDesc: '2～3 格（高地 2～4）',
+      traitDesc: '曲射支援（可攻擊共享視野內目標）；無法攻擊距離 1 貼身敵人，且近戰無法反擊。'
+    },
+    cavalry: {
+      name: '輕騎', char: '騎', maxHp: 9, baseAtk: 5, baseDef: 2, mp: 4, vision: 4,
+      rangeDesc: '1 格',
+      traitDesc: '衝鋒（起點與終點曼哈頓距離 ≥3 且終點非樹林時，本回合攻擊+2）；無偵察後退。'
+    }
+  };
+
+  // 藍方標準 180° 中心對稱開局佈陣（紅方以 (9-x, 9-y) 生成）
+  // 藍方：旗手(5,9)、弓手(4,9)、重盾A(3,8)、重盾B(6,8)、長矛A(4,8)、長矛B(5,8)、左輕騎(1,8)、右輕騎(8,8)
+  const INITIAL_BLUE_UNITS = [
+    { type: 'shield',  x: 3, y: 8 },
+    { type: 'shield',  x: 6, y: 8 },
+    { type: 'spear',   x: 4, y: 8 },
+    { type: 'spear',   x: 5, y: 8 },
+    { type: 'cavalry', x: 1, y: 8 },
+    { type: 'cavalry', x: 8, y: 8 },
+    { type: 'archer',  x: 4, y: 9 },
+    { type: 'flag',    x: 5, y: 9 }
+  ];
+
+  /* =========================================================
+   * 二、狀態結構、靜態棋盤 DOM 參考與初始化
+   * ========================================================= */
+  let state = null;
+  let hoveredTile = null;      // { x, y }
+  let previewPath = [];        // 懸停可移動格的最短路徑
+  let floatEffects = [];       // { x, y, text, color, id }
+  let ambushFlashCoord = null; // { x, y }
+
+  // 靜態保存 10×10 格子的 DOM 節點，徹底杜絕 hover 重建 DOM 吞掉點擊事件的 Bug
+  let tileRefs = [];
+  let boardInitialized = false;
+
+  const keyOf = (x, y) => `${x},${y}`;
+  const inBounds = (x, y) => x >= 0 && x < BOARD_SIZE && y >= 0 && y < BOARD_SIZE;
+  const manhattan = (x1, y1, x2, y2) => Math.abs(x1 - x2) + Math.abs(y1 - y2);
+  const opponentOf = (faction) => (faction === 'blue' ? 'red' : 'blue');
+  const factionName = (faction) => (faction === 'blue' ? '藍方' : '紅方');
+
+  function createTerrainGrid() {
+    const grid = [];
+    for (let y = 0; y < BOARD_SIZE; y++) {
+      const row = [];
+      for (let x = 0; x < BOARD_SIZE; x++) {
+        row.push({ terrain: 'plain', elev: 0 });
+      }
+      grid.push(row);
+    }
+    for (const [x, y] of HILL_COORDS) {
+      if (inBounds(x, y)) grid[y][x] = { terrain: 'hill', elev: 1 };
+    }
+    for (const [x, y] of FOREST_COORDS) {
+      if (inBounds(x, y)) grid[y][x] = { terrain: 'forest', elev: 0 };
+    }
+    return grid;
+  }
+
+  function createInitialUnits() {
+    const units = [];
+    let bId = 1;
+    for (const cfg of INITIAL_BLUE_UNITS) {
+      const def = UNIT_DEFS[cfg.type];
+      units.push({
+        id: `B${bId++}`,
+        faction: 'blue',
+        type: cfg.type,
+        x: cfg.x,
+        y: cfg.y,
+        hp: def.maxHp,
+        maxHp: def.maxHp,
+        alive: true
+      });
+    }
+    let rId = 1;
+    for (const cfg of INITIAL_BLUE_UNITS) {
+      const def = UNIT_DEFS[cfg.type];
+      units.push({
+        id: `R${rId++}`,
+        faction: 'red',
+        type: cfg.type,
+        x: 9 - cfg.x,
+        y: 9 - cfg.y,
+        hp: def.maxHp,
+        maxHp: def.maxHp,
+        alive: true
+      });
+    }
+
+    // 嚴格驗證初始單位資料：範圍 0..9、無座標重疊、ID 唯一
+    const usedCoords = new Set();
+    const usedIds = new Set();
+    for (const u of units) {
+      if (!inBounds(u.x, u.y)) {
+        throw new Error(`單位 ${u.id} 座標超出邊界 (${u.x},${u.y})`);
+      }
+      const k = keyOf(u.x, u.y);
+      if (usedCoords.has(k)) {
+        throw new Error(`單位座標重疊於 (${u.x},${u.y})`);
+      }
+      if (usedIds.has(u.id)) {
+        throw new Error(`單位 ID 重複：${u.id}`);
+      }
+      usedCoords.add(k);
+      usedIds.add(u.id);
+    }
+    return units;
+  }
+
+  /**
+   * 一次性建立 11×11 靜態棋盤 DOM 並於父層綁定事件委派，
+   * 確保 0..9 所有 100 格絕不因滑鼠移動重繪而被銷毀或吞掉 click。
+   */
+  function buildBoardDOM() {
+    if (boardInitialized) return;
+    const boardEl = document.getElementById('board');
+    boardEl.innerHTML = '';
+    tileRefs = Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(null));
+
+    const corner = document.createElement('div');
+    corner.className = 'coord-label';
+    corner.textContent = 'Y\\X';
+    boardEl.appendChild(corner);
+
+    for (let x = 0; x < BOARD_SIZE; x++) {
+      const lbl = document.createElement('div');
+      lbl.className = 'coord-label';
+      lbl.textContent = String(x);
+      boardEl.appendChild(lbl);
+    }
+
+    for (let y = 0; y < BOARD_SIZE; y++) {
+      const yLbl = document.createElement('div');
+      yLbl.className = 'coord-label';
+      yLbl.textContent = String(y);
+      boardEl.appendChild(yLbl);
+
+      for (let x = 0; x < BOARD_SIZE; x++) {
+        const tile = document.createElement('div');
+        tile.className = 'tile';
+        tile.dataset.x = String(x);
+        tile.dataset.y = String(y);
+        tile.setAttribute('role', 'gridcell');
+        tile.setAttribute('aria-label', `方格 (${x}, ${y})`);
+        boardEl.appendChild(tile);
+        tileRefs[y][x] = tile;
+      }
+    }
+
+    // 單一事件委派：點擊與懸停皆直接讀取 .tile 的 data-x / data-y
+    boardEl.addEventListener('click', (e) => {
+      const tile = e.target.closest('.tile');
+      if (!tile) return;
+      const x = Number(tile.dataset.x);
+      const y = Number(tile.dataset.y);
+      if (!inBounds(x, y)) return;
+      onTileClick(x, y);
+    });
+
+    boardEl.addEventListener('pointermove', (e) => {
+      const tile = e.target.closest('.tile');
+      if (!tile) return;
+      const x = Number(tile.dataset.x);
+      const y = Number(tile.dataset.y);
+      if (!inBounds(x, y)) return;
+      onTileHover(x, y);
+    });
+
+    boardEl.addEventListener('mouseleave', () => {
+      hoveredTile = null;
+      previewPath = [];
+      updateHoverVisuals();
+      renderInspector();
+      if (state && (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK')) {
+        renderCombatPreview();
+      }
+    });
+
+    boardInitialized = true;
+  }
+
+  function initGame() {
+    try {
+      buildBoardDOM();
+
+      state = {
+        map: createTerrainGrid(),
+        units: createInitialUnits(),
+        turn: 1,
+        activeFaction: 'blue',
+        // 'SELECT_OR_ACT' | 'POST_MOVE_ATTACK' | 'LOCKED_END' | 'GAME_OVER'
+        phase: 'SELECT_OR_ACT',
+        selectedUnitId: null,
+        reachableMap: new Map(),
+        attackableIds: new Set(),
+        chargeDisplacementThisTurn: 0,
+        skipConfirmPending: false,
+        lockReason: '',
+        lastSeen: { blue: {}, red: {} },
+        vision: null,
+        logs: [],
+        revealAllEndgame: false,
+        winner: null,
+        victoryReason: ''
+      };
+
+      hoveredTile = null;
+      previewPath = [];
+      floatEffects = [];
+      ambushFlashCoord = null;
+
+      addLog('戰役展開！藍方先手，回合上限 80 回合，斬首敵方旗手立即獲勝。', 'system');
+      recomputeVision('blue');
+      openHandoverModal();
+      renderAll();
+    } catch (err) {
+      console.error('初始化戰場失敗:', err);
+    }
+  }
+
+  /* =========================================================
+   * 三、基礎查詢工具
+   * ========================================================= */
+  function getUnitById(id) {
+    return state.units.find(u => u.id === id) || null;
+  }
+
+  function getUnitAt(x, y) {
+    return state.units.find(u => u.alive && u.x === x && u.y === y) || null;
+  }
+
+  function getAliveFlag(faction) {
+    return state.units.find(u => u.alive && u.faction === faction && u.type === 'flag') || null;
+  }
+
+  function getTerrainName(terrain) {
+    if (terrain === 'hill') return '▲ 高地（海拔 1）';
+    if (terrain === 'forest') return '🌲 樹林（海拔 0）';
+    return '平地（海拔 0）';
+  }
+
+  /* =========================================================
+   * 四、精確格線射線視野（海拔遮蔽＋林內隱蔽 ≤ 2.05）
+   * ========================================================= */
+
+  /**
+   * 2D 格線 DDA 射線追蹤（含嚴格斜角對稱夾縫檢查，杜絕斜角穿牆）
+   * - 平地（海拔 0）：看不到高地（除非曼哈頓距離 = 1）；途中遇高地或樹林遮蔽後方所有格。
+   * - 高地（海拔 1）：可越過低地樹林看到後方平地；途中經另一高地時遮蔽後方低地。
+   */
+  function hasLineOfSight(x0, y0, x1, y1, obsElev) {
+    if (x0 === x1 && y0 === y1) return true;
+
+    const targetElev = state.map[y1][x1].elev;
+    const mDist = manhattan(x0, y0, x1, y1);
+
+    // 平地觀察者無法看見高地，除非距離 = 1（仰望崖邊）
+    if (obsElev === 0 && targetElev === 1) {
+      return mDist === 1;
+    }
+
+    if (mDist === 1) return true;
+
+    const isBlocker = (cx, cy) => {
+      const cell = state.map[cy][cx];
+      if (obsElev === 0) {
+        return cell.elev > 0 || cell.terrain === 'forest';
+      } else {
+        if (cell.elev > obsElev) return true;
+        if (cell.elev >= obsElev && targetElev < obsElev) return true;
+        return false;
+      }
+    };
+
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const sx = Math.sign(dx);
+    const sy = Math.sign(dy);
+
+    const stepTx = dx === 0 ? Infinity : Math.abs(1 / dx);
+    const stepTy = dy === 0 ? Infinity : Math.abs(1 / dy);
+
+    let tMaxX = dx === 0 ? Infinity : stepTx * 0.5;
+    let tMaxY = dy === 0 ? Infinity : stepTy * 0.5;
+
+    let cx = x0;
+    let cy = y0;
+    const EPS = 1e-9;
+
+    while (cx !== x1 || cy !== y1) {
+      if (Math.abs(tMaxX - tMaxY) < EPS) {
+        const b1 = inBounds(cx + sx, cy) && isBlocker(cx + sx, cy);
+        const b2 = inBounds(cx, cy + sy) && isBlocker(cx, cy + sy);
+        if (b1 && b2) return false;
+
+        cx += sx;
+        cy += sy;
+        tMaxX += stepTx;
+        tMaxY += stepTy;
+      } else if (tMaxX < tMaxY) {
+        cx += sx;
+        tMaxX += stepTx;
+      } else {
+        cy += sy;
+        tMaxY += stepTy;
+      }
+
+      if (cx === x1 && cy === y1) return true;
+
+      if (!inBounds(cx, cy)) return false;
+      if (isBlocker(cx, cy)) return false;
+    }
+
+    return true;
+  }
+
+  function computeVisionData(faction) {
+    const tileVisible = Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(false));
+    const forestReveal = Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(false));
+
+    const allies = state.units.filter(u => u.alive && u.faction === faction);
+
+    for (const u of allies) {
+      const def = UNIT_DEFS[u.type];
+      const obsElev = state.map[u.y][u.x].elev;
+      const radius = def.vision + (obsElev === 1 ? 1 : 0);
+      const maxEuclid = radius + 0.5;
+
+      for (let y = 0; y < BOARD_SIZE; y++) {
+        for (let x = 0; x < BOARD_SIZE; x++) {
+          const eDist = Math.hypot(x - u.x, y - u.y);
+          if (eDist > maxEuclid) continue;
+
+          if (hasLineOfSight(u.x, u.y, x, y, obsElev)) {
+            tileVisible[y][x] = true;
+            if (eDist <= 2.05) {
+              forestReveal[y][x] = true;
+            }
+          }
+        }
+      }
+    }
+
+    const detectedEnemyIds = new Set();
+    const enemies = state.units.filter(u => u.alive && u.faction !== faction);
+    for (const e of enemies) {
+      const cell = state.map[e.y][e.x];
+      const isDetected = cell.terrain === 'forest'
+        ? forestReveal[e.y][e.x]
+        : tileVisible[e.y][e.x];
+      if (isDetected) {
+        detectedEnemyIds.add(e.id);
+      }
+    }
+
+    return { tileVisible, forestReveal, detectedEnemyIds };
+  }
+
+  function recomputeVision(faction) {
+    const v = computeVisionData(faction);
+    state.vision = v;
+
+    const mem = state.lastSeen[faction];
+    const enemies = state.units.filter(u => u.faction !== faction);
+
+    for (const e of enemies) {
+      if (!e.alive) {
+        delete mem[e.id];
+        continue;
+      }
+      if (v.detectedEnemyIds.has(e.id)) {
+        mem[e.id] = {
+          x: e.x,
+          y: e.y,
+          turn: state.turn,
+          type: e.type,
+          faction: e.faction
+        };
+      } else if (mem[e.id]) {
+        const g = mem[e.id];
+        const cell = state.map[g.y][g.x];
+        const confirmedEmpty = cell.terrain === 'forest'
+          ? v.forestReveal[g.y][g.x]
+          : v.tileVisible[g.y][g.x];
+        if (confirmedEmpty) {
+          delete mem[e.id];
+        }
+      }
+    }
+  }
+
+  function isUnitVisible(unit) {
+    if (state.revealAllEndgame) return true;
+    if (unit.faction === state.activeFaction) return true;
+    return state.vision && state.vision.detectedEnemyIds.has(unit.id);
+  }
+
+  /* =========================================================
+   * 五、完整控制區（ZoC）與 Dijkstra 尋路
+   * ========================================================= */
+
+  function isInEnemyShieldZoc(x, y, myFaction, onlyVisible) {
+    for (const d of DIRS) {
+      const nx = x + d.dx;
+      const ny = y + d.dy;
+      if (!inBounds(nx, ny)) continue;
+      const u = getUnitAt(nx, ny);
+      if (u && u.faction !== myFaction && u.type === 'shield') {
+        if (!onlyVisible || state.vision.detectedEnemyIds.has(u.id)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function getMoveStepCost(fromX, fromY, toX, toY) {
+    const fromCell = state.map[fromY][fromX];
+    const toCell = state.map[toY][toX];
+    if (toCell.terrain === 'forest') return 2;
+    if (toCell.terrain === 'hill') {
+      return fromCell.elev === 0 ? 2 : 1;
+    }
+    return 1;
+  }
+
+  function computeReachable(unit) {
+    const maxMp = UNIT_DEFS[unit.type].mp;
+    const startsInZoc = isInEnemyShieldZoc(unit.x, unit.y, unit.faction, true);
+
+    const best = new Map();
+    const startKey = keyOf(unit.x, unit.y);
+    best.set(startKey, {
+      x: unit.x, y: unit.y, cost: 0, steps: 0, locked: false, parentKey: null
+    });
+
+    const open = [best.get(startKey)];
+
+    while (open.length > 0) {
+      open.sort((a, b) => (a.cost !== b.cost ? a.cost - b.cost : a.steps - b.steps));
+      const cur = open.shift();
+      const curKey = keyOf(cur.x, cur.y);
+      if (cur !== best.get(curKey)) continue;
+
+      if (cur.locked) continue;
+
+      for (const d of DIRS) {
+        const nx = cur.x + d.dx;
+        const ny = cur.y + d.dy;
+        if (!inBounds(nx, ny)) continue;
+
+        const occ = getUnitAt(nx, ny);
+        if (occ && occ.faction !== unit.faction && state.vision.detectedEnemyIds.has(occ.id)) {
+          continue;
+        }
+
+        let stepCost = getMoveStepCost(cur.x, cur.y, nx, ny);
+        if (cur.x === unit.x && cur.y === unit.y && startsInZoc) {
+          stepCost += 1;
+        }
+
+        const newCost = cur.cost + stepCost;
+        if (newCost > maxMp) continue;
+
+        const newSteps = cur.steps + 1;
+        const nextLocked = isInEnemyShieldZoc(nx, ny, unit.faction, true);
+        const nKey = keyOf(nx, ny);
+        const prev = best.get(nKey);
+
+        if (!prev || newCost < prev.cost || (newCost === prev.cost && newSteps < prev.steps)) {
+          const node = {
+            x: nx, y: ny, cost: newCost, steps: newSteps, locked: nextLocked, parentKey: curKey
+          };
+          best.set(nKey, node);
+          open.push(node);
+        }
+      }
+    }
+
+    const result = new Map();
+    for (const [k, node] of best.entries()) {
+      if (k === startKey) continue;
+      const occ = getUnitAt(node.x, node.y);
+      if (occ && occ.faction === unit.faction) continue;
+
+      const path = [];
+      let pKey = k;
+      while (pKey !== null) {
+        const pNode = best.get(pKey);
+        path.unshift({ x: pNode.x, y: pNode.y });
+        pKey = pNode.parentKey;
+      }
+      result.set(k, {
+        x: node.x,
+        y: node.y,
+        cost: node.cost,
+        steps: node.steps,
+        entersZoc: node.locked,
+        path
+      });
+    }
+    return result;
+  }
+
+  /* =========================================================
+   * 六、射程判定與布陣戰鬥結算公式
+   * ========================================================= */
+
+  function canUnitAttackTarget(attacker, target) {
+    if (!attacker.alive || !target.alive) return false;
+    if (attacker.faction === target.faction) return false;
+    if (!state.vision.detectedEnemyIds.has(target.id)) return false;
+
+    const dist = manhattan(attacker.x, attacker.y, target.x, target.y);
+    const atkElev = state.map[attacker.y][attacker.x].elev;
+    const defElev = state.map[target.y][target.x].elev;
+
+    if (attacker.type === 'archer') {
+      const maxRange = atkElev === 1 ? 4 : 3;
+      return dist >= 2 && dist <= maxRange;
+    }
+
+    if (attacker.type === 'spear') {
+      const dx = target.x - attacker.x;
+      const dy = target.y - attacker.y;
+      if (dx !== 0 && dy !== 0) return false;
+      if (dist === 1) return true;
+      if (dist === 2) {
+        if (atkElev === 0 && defElev === 1) return false;
+        const mx = attacker.x + dx / 2;
+        const my = attacker.y + dy / 2;
+        if (atkElev === 0 && state.map[my][mx].elev === 1) return false;
+        const midUnit = getUnitAt(mx, my);
+        if (midUnit && midUnit.faction !== attacker.faction) return false;
+        return true;
+      }
+      return false;
+    }
+
+    return dist === 1;
+  }
+
+  function getValidAttackTargets(attacker) {
+    const ids = new Set();
+    for (const u of state.units) {
+      if (u.alive && u.faction !== attacker.faction && canUnitAttackTarget(attacker, u)) {
+        ids.add(u.id);
+      }
+    }
+    return ids;
+  }
+
+  function countAdjacentUnits(x, y, targetFaction, excludeId = null) {
+    let count = 0;
+    for (const d of DIRS) {
+      const nx = x + d.dx;
+      const ny = y + d.dy;
+      if (!inBounds(nx, ny)) continue;
+      const u = getUnitAt(nx, ny);
+      if (u && u.faction === targetFaction && u.id !== excludeId) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  function hasFlagAura(unit) {
+    if (unit.type === 'flag') return false;
+    const flag = getAliveFlag(unit.faction);
+    if (!flag) return false;
+    const d = manhattan(unit.x, unit.y, flag.x, flag.y);
+    return d >= 1 && d <= 2;
+  }
+
+  function calcEffectiveAtk(attacker, defender, dist, isCounter, chargeDisplacement) {
+    const def = UNIT_DEFS[attacker.type];
+    let total = def.baseAtk;
+    const items = [{ label: '基礎攻擊', val: def.baseAtk }];
+
+    if (hasFlagAura(attacker)) {
+      total += 1;
+      items.push({ label: '軍旗激勵', val: +1 });
+    }
+
+    const atkElev = state.map[attacker.y][attacker.x].elev;
+    const defElev = state.map[defender.y][defender.x].elev;
+    if (atkElev > defElev) {
+      total += 1;
+      items.push({ label: '高打低', val: +1 });
+    } else if (atkElev < defElev) {
+      total -= 1;
+      items.push({ label: '低打高', val: -1 });
+    }
+
+    if (!isCounter && attacker.type === 'spear' && dist === 2) {
+      total -= 1;
+      items.push({ label: '長柄距2', val: -1 });
+    }
+
+    if (attacker.type === 'spear' && defender.type === 'cavalry') {
+      total += 2;
+      items.push({ label: '反騎槍陣', val: +2 });
+    }
+
+    if (
+      !isCounter &&
+      attacker.type === 'cavalry' &&
+      chargeDisplacement >= 3 &&
+      state.map[attacker.y][attacker.x].terrain !== 'forest'
+    ) {
+      total += 2;
+      items.push({ label: `衝鋒⚡(位移${chargeDisplacement})`, val: +2 });
+    }
+
+    return { total, items };
+  }
+
+  function calcEffectiveDef(defender, attacker, dist) {
+    const def = UNIT_DEFS[defender.type];
+    let total = def.baseDef;
+    const items = [{ label: '基礎防禦', val: def.baseDef }];
+
+    if (hasFlagAura(defender)) {
+      total += 1;
+      items.push({ label: '軍旗激勵', val: +1 });
+    }
+
+    const defTerrain = state.map[defender.y][defender.x].terrain;
+    if (defTerrain === 'forest') {
+      total += 1;
+      items.push({ label: '樹林掩護', val: +1 });
+      if (dist >= 2) {
+        total += 1;
+        items.push({ label: '林內遠程減傷', val: +1 });
+      }
+    }
+
+    if (defender.type === 'shield' && dist >= 2) {
+      total += 2;
+      items.push({ label: '盾牌格擋', val: +2 });
+    }
+
+    const allyAdj = countAdjacentUnits(defender.x, defender.y, defender.faction, defender.id);
+    const supportBonus = Math.min(2, allyAdj);
+    if (supportBonus > 0) {
+      total += supportBonus;
+      items.push({ label: `鄰接援護(${allyAdj}友)`, val: +supportBonus });
+    }
+
+    const enemyAdj = countAdjacentUnits(defender.x, defender.y, opponentOf(defender.faction));
+    const isFlanked = enemyAdj >= 2;
+    if (isFlanked) {
+      total -= 2;
+      items.push({ label: `夾擊破防(${enemyAdj}敵)`, val: -2 });
+    }
+
+    return { total, items, isFlanked, supportBonus };
+  }
+
+  function previewCombat(attacker, defender, chargeDisplacement) {
+    const dist = manhattan(attacker.x, attacker.y, defender.x, defender.y);
+    const atkRes = calcEffectiveAtk(attacker, defender, dist, false, chargeDisplacement);
+    const defRes = calcEffectiveDef(defender, attacker, dist);
+
+    const damage = Math.max(1, atkRes.total - defRes.total);
+    const defenderSurvives = (defender.hp - damage) > 0;
+
+    let canCounter = true;
+    let noCounterReason = '';
+    if (!defenderSurvives) {
+      canCounter = false;
+      noCounterReason = '守方預計陣亡';
+    } else if (dist !== 1) {
+      canCounter = false;
+      noCounterReason = '遠程攻擊無法反擊';
+    } else if (defRes.isFlanked) {
+      canCounter = false;
+      noCounterReason = '守方遭夾擊無法反擊';
+    } else if (defender.type === 'archer') {
+      canCounter = false;
+      noCounterReason = '弓手無法近戰反擊';
+    }
+
+    let counterDamage = 0;
+    let counterAtkRes = null;
+    let counterDefRes = null;
+
+    if (canCounter) {
+      counterAtkRes = calcEffectiveAtk(defender, attacker, 1, true, 0);
+      counterDefRes = calcEffectiveDef(attacker, defender, 1);
+      counterDamage = Math.max(0, counterAtkRes.total - 1 - counterDefRes.total);
+    }
+
+    return {
+      dist,
+      atkRes,
+      defRes,
+      damage,
+      defenderSurvives,
+      canCounter,
+      noCounterReason,
+      counterDamage,
+      counterAtkRes,
+      counterDefRes,
+      attackerSurvives: (attacker.hp - counterDamage) > 0
+    };
+  }
+
+  /* =========================================================
+   * 七、回合執行：選子、移動落子無悔、伏擊中斷、直攻與換邊
+   * ========================================================= */
+
+  function resetSkipConfirm() {
+    if (state.skipConfirmPending) {
+      state.skipConfirmPending = false;
+    }
+  }
+
+  function selectUnit(unit) {
+    if (state.phase !== 'SELECT_OR_ACT') return;
+    if (!unit || !unit.alive || unit.faction !== state.activeFaction) return;
+
+    resetSkipConfirm();
+    state.selectedUnitId = unit.id;
+    state.chargeDisplacementThisTurn = 0;
+    state.reachableMap = computeReachable(unit);
+    state.attackableIds = getValidAttackTargets(unit);
+    previewPath = [];
+    renderAll();
+  }
+
+  function clearSelection() {
+    if (state.phase !== 'SELECT_OR_ACT') return;
+    resetSkipConfirm();
+    state.selectedUnitId = null;
+    state.reachableMap.clear();
+    state.attackableIds.clear();
+    previewPath = [];
+    renderAll();
+  }
+
+  function executeMoveTo(tx, ty) {
+    if (state.phase !== 'SELECT_OR_ACT' || !state.selectedUnitId) return;
+    const unit = getUnitById(state.selectedUnitId);
+    const targetInfo = state.reachableMap.get(keyOf(tx, ty));
+    if (!unit || !targetInfo) return;
+
+    resetSkipConfirm();
+    const path = targetInfo.path;
+    const startX = unit.x;
+    const startY = unit.y;
+    previewPath = [];
+    state.reachableMap.clear();
+
+    let ambushed = false;
+    let ambushEnemy = null;
+    let zocInterrupted = false;
+
+    for (let i = 1; i < path.length; i++) {
+      const next = path[i];
+      const occ = getUnitAt(next.x, next.y);
+
+      if (occ && occ.faction !== unit.faction) {
+        ambushed = true;
+        ambushEnemy = occ;
+        recomputeVision(state.activeFaction);
+        break;
+      }
+
+      unit.x = next.x;
+      unit.y = next.y;
+      recomputeVision(state.activeFaction);
+
+      if (i < path.length - 1 && isInEnemyShieldZoc(unit.x, unit.y, unit.faction, false)) {
+        zocInterrupted = true;
+        break;
+      }
+    }
+
+    const displacement = manhattan(startX, startY, unit.x, unit.y);
+    state.chargeDisplacementThisTurn = displacement;
+    const uName = `${factionName(unit.faction)}${UNIT_DEFS[unit.type].name}`;
+
+    if (ambushed) {
+      state.phase = 'LOCKED_END';
+      state.attackableIds.clear();
+      state.lockReason = `遭遇伏擊！在 (${ambushEnemy.x},${ambushEnemy.y}) 撞上隱藏的${factionName(ambushEnemy.faction)}${UNIT_DEFS[ambushEnemy.type].name}，行動強制中止（不可攻擊）。請檢視情報後結束回合。`;
+      ambushFlashCoord = { x: ambushEnemy.x, y: ambushEnemy.y };
+      addFloatEffect(ambushEnemy.x, ambushEnemy.y, '伏擊揭露！', '#f59e0b');
+      addFloatEffect(unit.x, unit.y, '行動中止', '#ef4444');
+      addLog(
+        `【迷霧伏擊】${uName} 從 (${startX},${startY}) 移動時於 (${ambushEnemy.x},${ambushEnemy.y}) 撞上隱藏的${factionName(ambushEnemy.faction)}${UNIT_DEFS[ambushEnemy.type].name}！強制停在 (${unit.x},${unit.y}) 並鎖定本回合。`,
+        'ambush'
+      );
+      renderAll();
+      setTimeout(() => {
+        ambushFlashCoord = null;
+        renderBoard();
+      }, 1800);
+      return;
+    }
+
+    const chargeTriggered = unit.type === 'cavalry' && displacement >= 3 && state.map[unit.y][unit.x].terrain !== 'forest';
+    if (zocInterrupted) {
+      addFloatEffect(unit.x, unit.y, '重盾ZoC攔截', '#fb923c');
+      addLog(
+        `【控制區攔截】${uName} 移動至 (${unit.x},${unit.y}) 踏入隱藏敵方重盾控制區，移動中止（位移 ${displacement} 格）。`,
+        'ambush'
+      );
+    } else {
+      addLog(
+        `${uName} 移動：(${startX},${startY}) → (${unit.x},${unit.y})（起終曼距 ${displacement}${chargeTriggered ? '，衝鋒⚡就緒 +2攻' : ''}）。`,
+        state.activeFaction
+      );
+    }
+
+    state.attackableIds = getValidAttackTargets(unit);
+    if (state.attackableIds.size > 0) {
+      state.phase = 'POST_MOVE_ATTACK';
+      state.lockReason = '';
+    } else {
+      state.phase = 'LOCKED_END';
+      state.lockReason = `${uName} 已完成移動（落子無悔），射程內無可見敵軍。請檢視更新後的戰爭迷霧，再點擊「結束回合並換邊」。`;
+    }
+
+    renderAll();
+  }
+
+  function executeAttack(target) {
+    if (state.phase !== 'SELECT_OR_ACT' && state.phase !== 'POST_MOVE_ATTACK') return;
+    if (!state.selectedUnitId || !state.attackableIds.has(target.id)) return;
+
+    const attacker = getUnitById(state.selectedUnitId);
+    if (!attacker || !attacker.alive) return;
+
+    resetSkipConfirm();
+    const isStandingAttack = (state.phase === 'SELECT_OR_ACT');
+    const chargeDisp = isStandingAttack ? 0 : state.chargeDisplacementThisTurn;
+    const res = previewCombat(attacker, target, chargeDisp);
+
+    state.reachableMap.clear();
+    state.attackableIds.clear();
+    previewPath = [];
+
+    target.hp = Math.max(0, target.hp - res.damage);
+    addFloatEffect(target.x, target.y, `-${res.damage}`, '#ef4444');
+
+    const atkName = `${factionName(attacker.faction)}${UNIT_DEFS[attacker.type].name}`;
+    const defName = `${factionName(target.faction)}${UNIT_DEFS[target.type].name}`;
+    let msg = `【${isStandingAttack ? '原地攻擊' : '移動攻擊'}】${atkName} 攻擊 ${defName}，造成 ${res.damage} 傷害（剩 ${target.hp}/${target.maxHp}）。`;
+
+    if (target.hp <= 0) {
+      target.alive = false;
+      msg += ` ${defName}陣亡！`;
+    } else if (res.canCounter) {
+      attacker.hp = Math.max(0, attacker.hp - res.counterDamage);
+      addFloatEffect(attacker.x, attacker.y, res.counterDamage > 0 ? `反擊 -${res.counterDamage}` : '反擊 0', '#facc15');
+      msg += ` ${defName}反擊造成 ${res.counterDamage} 傷害（攻方剩 ${attacker.hp}/${attacker.maxHp}）。`;
+      if (attacker.hp <= 0) {
+        attacker.alive = false;
+        msg += ` ${atkName}陣亡！`;
+      }
+    }
+
+    addLog(msg, 'combat');
+    recomputeVision(state.activeFaction);
+
+    if (checkVictoryAfterAction()) {
+      return;
+    }
+
+    state.phase = 'LOCKED_END';
+    state.lockReason = `戰鬥結算完成！請檢視傷害結果與最新視野，點擊「結束回合並換邊（空白鍵）」交棒給${factionName(opponentOf(state.activeFaction))}。`;
+    renderAll();
+  }
+
+  function checkVictoryAfterAction() {
+    const blueFlag = getAliveFlag('blue');
+    const redFlag = getAliveFlag('red');
+
+    if (!blueFlag && !redFlag) {
+      triggerGameOver('draw', '雙方旗手同歸於盡，平手！');
+      return true;
+    }
+    if (!redFlag) {
+      triggerGameOver('blue', '成功斬首紅方旗手！');
+      return true;
+    }
+    if (!blueFlag) {
+      triggerGameOver('red', '成功斬首藍方旗手！');
+      return true;
+    }
+    return false;
+  }
+
+  function countOccupiedHills(faction) {
+    return state.units.filter(
+      u => u.alive && u.faction === faction && state.map[u.y][u.x].terrain === 'hill'
+    ).length;
+  }
+
+  function checkTurnLimitVictory() {
+    const blueUnits = state.units.filter(u => u.alive && u.faction === 'blue');
+    const redUnits = state.units.filter(u => u.alive && u.faction === 'red');
+    const blueHp = blueUnits.reduce((s, u) => s + u.hp, 0);
+    const redHp = redUnits.reduce((s, u) => s + u.hp, 0);
+
+    if (blueHp > redHp) {
+      triggerGameOver('blue', `滿 ${MAX_TURNS} 回合，藍方總剩餘生命值勝出（${blueHp} vs ${redHp}）！`);
+      return true;
+    }
+    if (redHp > blueHp) {
+      triggerGameOver('red', `滿 ${MAX_TURNS} 回合，紅方總剩餘生命值勝出（${redHp} vs ${blueHp}）！`);
+      return true;
+    }
+
+    const blueHills = countOccupiedHills('blue');
+    const redHills = countOccupiedHills('red');
+    if (blueHills > redHills) {
+      triggerGameOver('blue', `滿 ${MAX_TURNS} 回合且總 HP 同分（${blueHp}），藍方佔領高地格數較多勝出（${blueHills} vs ${redHills}）！`);
+      return true;
+    }
+    if (redHills > blueHills) {
+      triggerGameOver('red', `滿 ${MAX_TURNS} 回合且總 HP 同分（${blueHp}），紅方佔領高地格數較多勝出（${redHills} vs ${blueHills}）！`);
+      return true;
+    }
+
+    triggerGameOver('draw', `滿 ${MAX_TURNS} 回合，雙方總 HP（${blueHp}）與佔領高地格數（${blueHills}）皆相同，握手言和！`);
+    return true;
+  }
+
+  function triggerGameOver(winner, reason) {
+    state.phase = 'GAME_OVER';
+    state.winner = winner;
+    state.victoryReason = reason;
+    state.revealAllEndgame = true;
+    state.reachableMap.clear();
+    state.attackableIds.clear();
+    addLog(`【終局】${winner === 'draw' ? '平手' : factionName(winner) + '獲勝'} — ${reason}`, 'victory');
+    renderAll();
+    showVictoryModal();
+  }
+
+  function endTurnAndSwitch() {
+    if (state.phase === 'GAME_OVER') return;
+    if (checkVictoryAfterAction()) return;
+
+    if (state.turn >= MAX_TURNS) {
+      checkTurnLimitVictory();
+      return;
+    }
+
+    state.turn += 1;
+    state.activeFaction = opponentOf(state.activeFaction);
+    state.phase = 'SELECT_OR_ACT';
+    state.selectedUnitId = null;
+    state.reachableMap.clear();
+    state.attackableIds.clear();
+    state.chargeDisplacementThisTurn = 0;
+    state.skipConfirmPending = false;
+    state.lockReason = '';
+    hoveredTile = null;
+    previewPath = [];
+
+    recomputeVision(state.activeFaction);
+    openHandoverModal();
+    renderAll();
+  }
+
+  /* =========================================================
+   * 八、畫面渲染（就地更新靜態格子，懸停僅切換 CSS 類別）
+   * ========================================================= */
+
+  function addLog(text, kind = 'system') {
+    state.logs.unshift({ turn: state.turn, text, kind });
+    if (state.logs.length > 100) state.logs.pop();
+  }
+
+  function addFloatEffect(x, y, text, color) {
+    const id = Math.random().toString(36).slice(2);
+    floatEffects.push({ x, y, text, color, id });
+    renderBoard();
+    setTimeout(() => {
+      floatEffects = floatEffects.filter(f => f.id !== id);
+      renderBoard();
+    }, 1400);
+  }
+
+  function renderAll() {
+    renderHeaderAndSummaries();
+    renderControls();
+    renderBoard();
+    updateHoverVisuals();
+    renderInspector();
+    renderCombatPreview();
+    renderBattleLog();
+  }
+
+  function renderHeaderAndSummaries() {
+    const isBlue = state.activeFaction === 'blue';
+    document.getElementById('turnBadge').textContent = `回合 ${state.turn} / ${MAX_TURNS}`;
+
+    const fBadge = document.getElementById('factionBadge');
+    fBadge.textContent = state.phase === 'GAME_OVER' ? '對局結束' : `${factionName(state.activeFaction)}行動`;
+    fBadge.className = state.phase === 'GAME_OVER'
+      ? 'px-3 py-1 rounded-full font-black bg-emerald-600 text-white shadow'
+      : (isBlue
+        ? 'px-3 py-1 rounded-full font-black bg-blue-600 text-white shadow'
+        : 'px-3 py-1 rounded-full font-black bg-red-600 text-white shadow');
+
+    const pBadge = document.getElementById('phaseBadge');
+    if (state.phase === 'SELECT_OR_ACT') {
+      pBadge.textContent = '選棋移動／原地直攻';
+      pBadge.className = 'px-3 py-1 rounded-full font-bold bg-sky-500/20 text-sky-300 border border-sky-500/40';
+    } else if (state.phase === 'POST_MOVE_ATTACK') {
+      pBadge.textContent = '移動後攻擊選擇';
+      pBadge.className = 'px-3 py-1 rounded-full font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40';
+    } else if (state.phase === 'LOCKED_END') {
+      pBadge.textContent = '行動已鎖定（待換邊）';
+      pBadge.className = 'px-3 py-1 rounded-full font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40';
+    } else {
+      pBadge.textContent = '終局（全圖揭露）';
+      pBadge.className = 'px-3 py-1 rounded-full font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40';
+    }
+
+    const blueAlive = state.units.filter(u => u.alive && u.faction === 'blue');
+    const redAlive = state.units.filter(u => u.alive && u.faction === 'red');
+    const blueHp = blueAlive.reduce((s, u) => s + u.hp, 0);
+    const redHp = redAlive.reduce((s, u) => s + u.hp, 0);
+    const blueHills = countOccupiedHills('blue');
+    const redHills = countOccupiedHills('red');
+    document.getElementById('blueSummary').textContent = `${blueAlive.length}子｜HP ${blueHp}｜高地 ${blueHills}`;
+    document.getElementById('redSummary').textContent = `${redAlive.length}子｜HP ${redHp}｜高地 ${redHills}`;
+
+    const statusText = document.getElementById('statusText');
+    const chargeHint = document.getElementById('chargeHint');
+    const sel = state.selectedUnitId ? getUnitById(state.selectedUnitId) : null;
+    chargeHint.classList.add('hidden');
+
+    if (state.phase === 'GAME_OVER') {
+      statusText.textContent = `對局結束：${state.winner === 'draw' ? '平手' : factionName(state.winner) + '獲勝'}（${state.victoryReason}）`;
+    } else if (state.phase === 'LOCKED_END') {
+      statusText.textContent = state.lockReason;
+    } else if (state.phase === 'SELECT_OR_ACT') {
+      if (!sel) {
+        statusText.textContent = `輪到${factionName(state.activeFaction)}：點選己方棋子可同時查看移動格與原地可攻紅框。`;
+      } else {
+        const def = UNIT_DEFS[sel.type];
+        const inZoc = isInEnemyShieldZoc(sel.x, sel.y, sel.faction, true);
+        const atkCount = state.attackableIds.size;
+        statusText.textContent = `已選 ${def.name}（MP ${def.mp}${inZoc ? '，敵重盾ZoC：離開+1MP' : ''}）：點藍格移動${atkCount > 0 ? `，或直接點紅框攻擊（${atkCount} 目標）` : ''}。`;
+      }
+    } else if (state.phase === 'POST_MOVE_ATTACK') {
+      if (sel && sel.type === 'cavalry' && state.chargeDisplacementThisTurn >= 3 && state.map[sel.y][sel.x].terrain !== 'forest') {
+        chargeHint.classList.remove('hidden');
+      }
+      statusText.textContent = `移動已鎖定！射程內有 ${state.attackableIds.size} 名可攻擊敵軍：懸停紅框看預測、點擊攻擊，或按「不攻擊，結束回合並換邊」。`;
+    }
+  }
+
+  function renderControls() {
+    const sel = state.selectedUnitId ? getUnitById(state.selectedUnitId) : null;
+    const titleEl = document.getElementById('selectedUnitTitle');
+    const btnEnd = document.getElementById('btnEndTurn');
+    const btnSkip = document.getElementById('btnSkipTurn');
+    const subHint = document.getElementById('actionSubHint');
+
+    titleEl.textContent = sel
+      ? `${factionName(sel.faction)}${UNIT_DEFS[sel.type].name} (${sel.x},${sel.y})`
+      : '尚未選中棋子';
+
+    btnEnd.classList.remove('btn-ready-pulse', 'bg-amber-600', 'hover:bg-amber-500', 'bg-emerald-600', 'hover:bg-emerald-500');
+
+    if (state.phase === 'POST_MOVE_ATTACK') {
+      btnEnd.disabled = false;
+      btnEnd.textContent = '不攻擊，結束回合並換邊（空白鍵）';
+      btnEnd.classList.add('bg-amber-600', 'hover:bg-amber-500');
+      subHint.textContent = '本回合移動已鎖定（無悔棋）。可點擊棋盤紅框攻擊，或按上方按鈕放棄攻擊並換邊。';
+    } else if (state.phase === 'LOCKED_END') {
+      btnEnd.disabled = false;
+      btnEnd.textContent = '結束回合並換邊（空白鍵）';
+      btnEnd.classList.add('bg-emerald-600', 'hover:bg-emerald-500', 'btn-ready-pulse');
+      subHint.textContent = '本回合行動已鎖定，請確認更新後的視野與傷害，按上方按鈕或空白鍵換邊。';
+    } else if (state.phase === 'GAME_OVER') {
+      btnEnd.disabled = true;
+      btnEnd.textContent = '對局已結束';
+      btnEnd.classList.add('bg-emerald-600');
+      subHint.textContent = '全圖戰爭迷霧已解除，可點擊棋盤檢視雙方陣容，或按「重新開始」。';
+    } else {
+      btnEnd.disabled = true;
+      btnEnd.textContent = '結束回合並換邊（空白鍵）';
+      btnEnd.classList.add('bg-emerald-600');
+      subHint.textContent = '點藍格移動、點紅框原地直攻；若本回合不行動，可點擊右側「跳過回合」。';
+    }
+
+    btnSkip.disabled = (state.phase !== 'SELECT_OR_ACT');
+    if (state.skipConfirmPending && state.phase === 'SELECT_OR_ACT') {
+      btnSkip.textContent = '再次點擊確認跳過';
+      btnSkip.className = 'shrink-0 px-2.5 py-1.5 rounded-lg text-xs font-black transition bg-amber-600 hover:bg-amber-500 border border-amber-300 text-white shadow';
+    } else {
+      btnSkip.textContent = '跳過回合';
+      btnSkip.className = 'shrink-0 px-2.5 py-1.5 rounded-lg text-xs font-bold transition bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed';
+    }
+  }
+
+  /**
+   * 就地更新 100 個靜態格子的內容與狀態類別（不重建外層 tile 元素）
+   */
+  function renderBoard() {
+    const selUnit = state.selectedUnitId ? getUnitById(state.selectedUnitId) : null;
+    const mem = state.lastSeen[state.activeFaction];
+
+    const ghostAt = new Map();
+    if (!state.revealAllEndgame) {
+      for (const [enemyId, g] of Object.entries(mem)) {
+        if (!state.vision.detectedEnemyIds.has(enemyId)) {
+          ghostAt.set(keyOf(g.x, g.y), g);
+        }
+      }
+    }
+
+    for (let y = 0; y < BOARD_SIZE; y++) {
+      for (let x = 0; x < BOARD_SIZE; x++) {
+        const tile = tileRefs[y][x];
+        const cell = state.map[y][x];
+        const k = keyOf(x, y);
+        const isVis = state.revealAllEndgame || state.vision.tileVisible[y][x];
+        const isForestRev = state.revealAllEndgame || state.vision.forestReveal[y][x];
+
+        const classes = ['tile'];
+        let html = '';
+
+        // 1. 地形樣式與標籤
+        if (cell.terrain === 'hill') {
+          classes.push('terrain-hill');
+          html += `<span class="terrain-tag hill-tag">▲高</span>`;
+        } else if (cell.terrain === 'forest') {
+          classes.push('terrain-forest');
+          html += `<span class="forest-icon">🌲</span>`;
+        } else {
+          classes.push((x + y) % 2 === 0 ? 'terrain-plain-even' : 'terrain-plain-odd');
+        }
+
+        // 2. 可見敵方重盾 ZoC 內框
+        if (!state.revealAllEndgame && isInEnemyShieldZoc(x, y, state.activeFaction, true)) {
+          html += `<div class="zoc-overlay"></div><span class="zoc-corner-tag">ZoC</span>`;
+        }
+
+        // 3. 戰爭迷霧與林內隱蔽提示
+        if (!isVis) {
+          html += `<div class="fog-overlay"></div>`;
+        } else if (cell.terrain === 'forest' && !isForestRev) {
+          html += `<div class="forest-conceal-overlay"></div><span class="terrain-tag text-emerald-100/90 bg-slate-900/60 px-1 rounded">隱</span>`;
+        }
+
+        // 4. 可移動落點與輕騎衝鋒⚡標示
+        if (state.phase === 'SELECT_OR_ACT' && selUnit && state.reachableMap.has(k)) {
+          classes.push('tile-reachable');
+          const rInfo = state.reachableMap.get(k);
+          if (selUnit.type === 'cavalry' && manhattan(selUnit.x, selUnit.y, x, y) >= 3 && cell.terrain !== 'forest') {
+            classes.push('tile-charge');
+            html += `<span class="charge-tile-badge">⚡</span>`;
+          }
+          html += `<span class="mp-hover-pill">${rInfo.cost}MP</span>`;
+        }
+
+        // 5. 伏擊格閃爍
+        if (ambushFlashCoord && ambushFlashCoord.x === x && ambushFlashCoord.y === y) {
+          classes.push('tile-ambush-flash');
+        }
+
+        // 6. 棋子或最後目擊殘影
+        const unit = getUnitAt(x, y);
+        if (unit && isUnitVisible(unit)) {
+          const def = UNIT_DEFS[unit.type];
+          const isSelected = selUnit && selUnit.id === unit.id && state.phase !== 'LOCKED_END' && state.phase !== 'GAME_OVER';
+          const hpPct = Math.max(0, Math.round((unit.hp / unit.maxHp) * 100));
+          const hpColor = hpPct > 55 ? '#4ade80' : (hpPct > 25 ? '#facc15' : '#f87171');
+
+          let badgesHtml = '';
+          if ((unit.faction === state.activeFaction || state.revealAllEndgame) && hasFlagAura(unit)) {
+            badgesHtml += `<span class="badge-aura">★</span>`;
+          }
+          const adjAllies = countVisibleAdjacentSameFaction(unit);
+          if (adjAllies > 0) {
+            badgesHtml += `<span class="badge-support">+${Math.min(2, adjAllies)}</span>`;
+          }
+          const adjEnemies = countVisibleAdjacentEnemies(unit);
+          if (adjEnemies >= 2) {
+            badgesHtml += `<span class="badge-flanked">夾</span>`;
+          }
+
+          html += `
+            <div class="unit-token ${unit.faction === 'blue' ? 'unit-blue' : 'unit-red'} ${isSelected ? 'unit-selected' : ''}">
+              <span class="unit-char">${def.char}</span>
+              <div class="hp-bar-wrap"><div class="hp-bar-fill" style="width:${hpPct}%; background:${hpColor};"></div></div>
+              <span class="hp-num">${unit.hp}/${unit.maxHp}</span>
+              ${badgesHtml}
+            </div>
+          `;
+
+          if ((state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK') && state.attackableIds.has(unit.id)) {
+            classes.push('tile-attackable');
+          }
+        } else if (ghostAt.has(k)) {
+          const g = ghostAt.get(k);
+          const def = UNIT_DEFS[g.type];
+          const turnsAgo = Math.max(0, state.turn - g.turn);
+          html += `
+            <div class="ghost-token ${g.faction === 'blue' ? 'ghost-blue' : 'ghost-red'}">
+              <span class="font-black text-sm leading-none">${def.char}</span>
+              <span class="text-[8px] font-bold mt-0.5 leading-none">${turnsAgo === 0 ? '剛目擊' : turnsAgo + '回前'}</span>
+            </div>
+          `;
+        }
+
+        // 7. 浮動傷害特效
+        for (const fx of floatEffects) {
+          if (fx.x === x && fx.y === y) {
+            html += `<div class="float-fx" style="color:${fx.color};">${fx.text}</div>`;
+          }
+        }
+
+        tile.className = classes.join(' ');
+        tile.innerHTML = html;
+      }
+    }
+  }
+
+  /**
+   * 輕量級懸停樣式更新：僅操作 CSS class，絕對不動 innerHTML，完全防止吃掉 click！
+   */
+  function updateHoverVisuals() {
+    const selUnit = state && state.selectedUnitId ? getUnitById(state.selectedUnitId) : null;
+    const pathSet = new Set();
+    let endKey = null;
+
+    if (state && state.phase === 'SELECT_OR_ACT' && selUnit && previewPath.length > 1) {
+      for (let i = 1; i < previewPath.length; i++) {
+        pathSet.add(keyOf(previewPath[i].x, previewPath[i].y));
+      }
+      const last = previewPath[previewPath.length - 1];
+      endKey = keyOf(last.x, last.y);
+    }
+
+    for (let y = 0; y < BOARD_SIZE; y++) {
+      for (let x = 0; x < BOARD_SIZE; x++) {
+        const tile = tileRefs[y][x];
+        if (!tile) continue;
+        const k = keyOf(x, y);
+        const isHovered = !!(hoveredTile && hoveredTile.x === x && hoveredTile.y === y);
+        tile.classList.toggle('tile-hovered', isHovered);
+        tile.classList.toggle('tile-path', pathSet.has(k));
+        tile.classList.toggle('tile-path-end', k === endKey);
+      }
+    }
+  }
+
+  function countVisibleAdjacentSameFaction(unit) {
+    let count = 0;
+    for (const d of DIRS) {
+      const nx = unit.x + d.dx, ny = unit.y + d.dy;
+      if (!inBounds(nx, ny)) continue;
+      const other = getUnitAt(nx, ny);
+      if (other && other.faction === unit.faction && isUnitVisible(other)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  function countVisibleAdjacentEnemies(unit) {
+    let count = 0;
+    for (const d of DIRS) {
+      const nx = unit.x + d.dx, ny = unit.y + d.dy;
+      if (!inBounds(nx, ny)) continue;
+      const other = getUnitAt(nx, ny);
+      if (other && other.faction !== unit.faction && isUnitVisible(other)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  function renderInspector() {
+    const coordEl = document.getElementById('inspectCoord');
+    const bodyEl = document.getElementById('inspectorBody');
+
+    let targetCoord = hoveredTile;
+    if (!targetCoord && state.selectedUnitId) {
+      const sel = getUnitById(state.selectedUnitId);
+      if (sel && sel.alive) targetCoord = { x: sel.x, y: sel.y };
+    }
+
+    if (!targetCoord) {
+      coordEl.textContent = '游標移至棋盤查看';
+      bodyEl.innerHTML = `<div class="text-slate-400">懸停或點擊棋盤格與可見單位，檢視地形海拔、林內隱蔽狀態與陣型加成。</div>`;
+      return;
+    }
+
+    const { x, y } = targetCoord;
+    const cell = state.map[y][x];
+    const isVis = state.revealAllEndgame || state.vision.tileVisible[y][x];
+    const isForestRev = state.revealAllEndgame || state.vision.forestReveal[y][x];
+    const inZoc = !state.revealAllEndgame && isInEnemyShieldZoc(x, y, state.activeFaction, true);
+
+    coordEl.textContent = `座標 (${x}, ${y})`;
+
+    let terrainEffect = '平地，移動 1 MP，無地形攻防修正。';
+    if (cell.terrain === 'hill') {
+      terrainEffect = '高地：平地踏入 2 MP；視野+1、高打低攻+1、弓手射程 2～4；遮蔽平地視線與後方低地。';
+    } else if (cell.terrain === 'forest') {
+      terrainEffect = '樹林：移動 2 MP；守方防+1（遠程再+1）；林內需歐距 ≤2.05 才現形；輕騎不可觸發衝鋒。';
+    }
+
+    const visBadge = isVis
+      ? (cell.terrain === 'forest' && !isForestRev
+        ? `<span class="px-1.5 py-0.5 rounded bg-amber-900/60 text-amber-200 border border-amber-700/60">視線內（歐距 &gt; 2.05，林內隱蔽）</span>`
+        : `<span class="px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-200 border border-emerald-700/60">清晰可見</span>`)
+      : `<span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">戰爭迷霧</span>`;
+
+    // 若懸停在可移動格上，顯示移動消耗與衝鋒預告
+    let movePreviewHtml = '';
+    if (state.phase === 'SELECT_OR_ACT' && state.selectedUnitId && state.reachableMap.has(keyOf(x, y))) {
+      const sel = getUnitById(state.selectedUnitId);
+      const rInfo = state.reachableMap.get(keyOf(x, y));
+      const disp = manhattan(sel.x, sel.y, x, y);
+      const willCharge = sel.type === 'cavalry' && disp >= 3 && cell.terrain !== 'forest';
+      movePreviewHtml = `
+        <p class="text-[11px] text-sky-300 font-bold">
+          ➤ 移動預覽：消耗 ${rInfo.cost} MP（起終曼距 ${disp}）${willCharge ? ' · ⚡ 觸發衝鋒 攻+2！' : ''}${rInfo.entersZoc ? ' · 踏入敵ZoC即停' : ''}
+        </p>
+      `;
+    }
+
+    let html = `
+      <div class="bg-slate-950/75 border border-slate-800 rounded-lg p-2.5 space-y-1">
+        <div class="flex flex-wrap items-center justify-between gap-1">
+          <span class="font-bold text-slate-100">${getTerrainName(cell.terrain)}</span>
+          ${visBadge}
+        </div>
+        <p class="text-[11px] text-slate-400">${terrainEffect}</p>
+        ${movePreviewHtml}
+        ${inZoc ? `<p class="text-[11px] text-orange-400 font-bold">⚠ 敵方重盾控制區（ZoC）：踏入即停；回合初在此離開需 +1 MP。</p>` : ''}
+      </div>
+    `;
+
+    const unit = getUnitAt(x, y);
+    if (unit && isUnitVisible(unit)) {
+      const def = UNIT_DEFS[unit.type];
+      const curVision = def.vision + (cell.elev === 1 ? 1 : 0);
+      const isFriendly = unit.faction === state.activeFaction;
+      const aura = (isFriendly || state.revealAllEndgame) && hasFlagAura(unit);
+      const sup = Math.min(2, countVisibleAdjacentSameFaction(unit));
+      const flanked = countVisibleAdjacentEnemies(unit) >= 2;
+
+      html += `
+        <div class="bg-slate-950/75 border ${unit.faction === 'blue' ? 'border-blue-800/70' : 'border-red-800/70'} rounded-lg p-2.5 space-y-1.5">
+          <div class="flex items-center justify-between">
+            <span class="font-black text-sm ${unit.faction === 'blue' ? 'text-blue-300' : 'text-red-300'}">
+              ${factionName(unit.faction)}｜${def.name}（${def.char}）
+            </span>
+            <span class="font-mono font-bold text-emerald-300">HP ${unit.hp}/${unit.maxHp}</span>
+          </div>
+          <div class="grid grid-cols-4 gap-1.5 text-center bg-slate-900 rounded p-1.5 font-mono text-[11px]">
+            <div><div class="text-slate-500">基礎攻</div><div class="font-bold text-white">${def.baseAtk}</div></div>
+            <div><div class="text-slate-500">基礎防</div><div class="font-bold text-white">${def.baseDef}</div></div>
+            <div><div class="text-slate-500">移動力</div><div class="font-bold text-white">${def.mp}</div></div>
+            <div><div class="text-slate-500">目前視野</div><div class="font-bold text-sky-300">${curVision}</div></div>
+          </div>
+          <div class="flex flex-wrap gap-1 text-[10px]">
+            <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">射程：${def.rangeDesc}</span>
+            ${aura ? `<span class="px-1.5 py-0.5 rounded bg-yellow-900/60 text-yellow-200 border border-yellow-700/60">★ 軍旗激勵 攻+1 防+1</span>` : ''}
+            ${sup > 0 ? `<span class="px-1.5 py-0.5 rounded bg-sky-900/60 text-sky-200 border border-sky-700/60">鄰接援護 防+${sup}</span>` : ''}
+            ${flanked ? `<span class="px-1.5 py-0.5 rounded bg-rose-900/60 text-rose-200 border border-rose-700/60">遭夾擊 防-2 無法反擊</span>` : ''}
+          </div>
+          <p class="text-[11px] text-slate-400 leading-snug">${def.traitDesc}</p>
+        </div>
+      `;
+    } else if (!state.revealAllEndgame) {
+      const mem = state.lastSeen[state.activeFaction];
+      const ghost = Object.values(mem).find(g => g.x === x && g.y === y);
+      if (ghost) {
+        const turnsAgo = Math.max(0, state.turn - ghost.turn);
+        html += `
+          <div class="bg-slate-950/75 border border-slate-700 border-dashed rounded-lg p-2.5 text-[11px] text-slate-300">
+            <span class="font-bold text-amber-300">最後目擊殘影：</span>${factionName(ghost.faction)}${UNIT_DEFS[ghost.type].name}（${turnsAgo === 0 ? '本回合剛目擊' : turnsAgo + ' 回合前目擊'}），目前動向不明。
+          </div>
+        `;
+      }
+    }
+
+    bodyEl.innerHTML = html;
+  }
+
+  function renderCombatPreview() {
+    const badge = document.getElementById('previewBadge');
+    const body = document.getElementById('combatPreviewBody');
+
+    const canPreview = (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK')
+      && state.selectedUnitId
+      && state.attackableIds.size > 0;
+
+    if (!canPreview) {
+      badge.textContent = '待命';
+      badge.className = 'text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-400';
+      body.innerHTML = `<div class="text-slate-400">選中己方棋子（或移動至敵軍射程內）後，將滑鼠移至紅框敵軍即可檢視完整攻防拆解與反擊預測。</div>`;
+      return;
+    }
+
+    const attacker = getUnitById(state.selectedUnitId);
+    let target = null;
+
+    if (hoveredTile) {
+      const u = getUnitAt(hoveredTile.x, hoveredTile.y);
+      if (u && state.attackableIds.has(u.id)) {
+        target = u;
+      }
+    }
+
+    if (!target && state.attackableIds.size === 1) {
+      target = getUnitById(Array.from(state.attackableIds)[0]);
+    }
+
+    if (!target) {
+      badge.textContent = `可攻 ${state.attackableIds.size} 目標`;
+      badge.className = 'text-[11px] px-2 py-0.5 rounded bg-rose-900/60 text-rose-200 font-bold';
+      body.innerHTML = `<div class="text-slate-300">射程內有 ${state.attackableIds.size} 名紅框敵軍：將滑鼠移至敵軍檢視傷害拆解，點擊立即發動攻擊。</div>`;
+      return;
+    }
+
+    const chargeDisp = state.phase === 'POST_MOVE_ATTACK' ? state.chargeDisplacementThisTurn : 0;
+    const modeLabel = state.phase === 'SELECT_OR_ACT' ? '原地直攻' : '移動後攻擊';
+    const res = previewCombat(attacker, target, chargeDisp);
+    const atkName = `${factionName(attacker.faction)}${UNIT_DEFS[attacker.type].name}`;
+    const defName = `${factionName(target.faction)}${UNIT_DEFS[target.type].name}`;
+
+    badge.textContent = `${modeLabel}｜距 ${res.dist} 格`;
+    badge.className = 'text-[11px] px-2 py-0.5 rounded bg-rose-900/80 text-rose-100 font-bold';
+
+    const formatBreakdown = (items) => items.map((it, idx) => {
+      if (idx === 0) return `<span class="text-slate-200">${it.label} ${it.val}</span>`;
+      const cls = it.val > 0 ? 'text-emerald-400' : 'text-rose-400';
+      const sign = it.val > 0 ? '+' : '';
+      return `<span class="${cls}">${it.label} ${sign}${it.val}</span>`;
+    }).join(' · ');
+
+    body.innerHTML = `
+      <div class="space-y-2">
+        <div class="flex items-center justify-between bg-slate-950/85 border border-slate-800 rounded-lg px-2.5 py-2">
+          <div>
+            <div class="font-bold text-slate-100">${atkName} <span class="text-slate-500">→</span> ${defName}</div>
+            <div class="text-[11px] text-slate-400">守方 HP：${target.hp} → <strong class="${res.defenderSurvives ? 'text-amber-300' : 'text-rose-400'}">${Math.max(0, target.hp - res.damage)}${res.defenderSurvives ? '' : '（預計擊殺！）'}</strong></div>
+          </div>
+          <div class="text-right">
+            <div class="text-[10px] text-slate-400">預計傷害</div>
+            <div class="text-xl font-black text-rose-400 leading-none">-${res.damage}</div>
+          </div>
+        </div>
+
+        <div class="bg-slate-950/65 rounded-lg p-2 space-y-1 text-[11px] border border-slate-800/80">
+          <div><strong class="text-sky-300">攻方有效攻 ${res.atkRes.total}：</strong>${formatBreakdown(res.atkRes.items)}</div>
+          <div><strong class="text-amber-300">守方有效防 ${res.defRes.total}：</strong>${formatBreakdown(res.defRes.items)}</div>
+        </div>
+
+        <div class="bg-slate-950/85 border ${res.canCounter ? 'border-amber-800/70' : 'border-slate-800'} rounded-lg px-2.5 py-2">
+          ${res.canCounter ? `
+            <div class="flex items-center justify-between mb-1">
+              <span class="font-bold text-amber-300">敵方預計反擊（有效攻 - 1 - 我方有效防）</span>
+              <span class="font-black text-amber-400 text-sm">-${res.counterDamage}</span>
+            </div>
+            <div class="text-[11px] text-slate-400 space-y-0.5">
+              <div>敵反擊攻 ${res.counterAtkRes.total}（-1懲罰 = ${res.counterAtkRes.total - 1}）：${formatBreakdown(res.counterAtkRes.items)}</div>
+              <div>我方有效防 ${res.counterDefRes.total}：${formatBreakdown(res.counterDefRes.items)}</div>
+              <div>我方 HP：${attacker.hp} → <strong class="${res.attackerSurvives ? 'text-slate-200' : 'text-rose-400'}">${Math.max(0, attacker.hp - res.counterDamage)}${res.attackerSurvives ? '' : '（預計陣亡！）'}</strong></div>
+            </div>
+          ` : `
+            <div class="text-[11px] text-emerald-300 font-bold">✓ 敵方無法反擊（${res.noCounterReason}）</div>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderBattleLog() {
+    const logEl = document.getElementById('battleLog');
+    logEl.innerHTML = state.logs.map(item => {
+      let badgeCls = 'bg-slate-800 text-slate-300';
+      let textCls = 'text-slate-300';
+      if (item.kind === 'blue') badgeCls = 'bg-blue-900/75 text-blue-200';
+      else if (item.kind === 'red') badgeCls = 'bg-red-900/75 text-red-200';
+      else if (item.kind === 'combat') { badgeCls = 'bg-rose-900/80 text-rose-200'; textCls = 'text-rose-100'; }
+      else if (item.kind === 'ambush') { badgeCls = 'bg-amber-700/85 text-amber-100'; textCls = 'text-amber-200 font-bold'; }
+      else if (item.kind === 'victory') { badgeCls = 'bg-emerald-700 text-white'; textCls = 'text-emerald-200 font-bold'; }
+
+      return `
+        <div class="bg-slate-950/65 border border-slate-800/80 rounded px-2 py-1.5 leading-snug">
+          <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold mr-1.5 ${badgeCls}">R${item.turn}</span>
+          <span class="${textCls}">${item.text}</span>
+        </div>
+      `;
+    }).join('');
+  }
+
+  /* =========================================================
+   * 九、互動事件（零 DOM 銷毀懸停 + 嚴格選棋切換）
+   * ========================================================= */
+
+  function onTileClick(x, y) {
+    hoveredTile = { x, y };
+
+    if (state.skipConfirmPending) {
+      resetSkipConfirm();
+      renderControls();
+    }
+
+    if (state.phase === 'LOCKED_END' || state.phase === 'GAME_OVER') {
+      updateHoverVisuals();
+      renderInspector();
+      return;
+    }
+
+    const clickedUnit = getUnitAt(x, y);
+
+    if (state.phase === 'SELECT_OR_ACT') {
+      const sel = state.selectedUnitId ? getUnitById(state.selectedUnitId) : null;
+
+      // 1. 已選子且點擊紅框敵軍 -> 直接原地發動攻擊
+      if (sel && clickedUnit && state.attackableIds.has(clickedUnit.id)) {
+        executeAttack(clickedUnit);
+        return;
+      }
+
+      // 2. 點擊已選中的自己 -> 取消選取
+      if (sel && clickedUnit && sel.id === clickedUnit.id) {
+        clearSelection();
+        return;
+      }
+
+      // 3. 點擊任一己方存活棋子（包含從其他棋子直接改點藍色右方騎兵）-> 立即切換選取
+      if (clickedUnit && clickedUnit.alive && clickedUnit.faction === state.activeFaction) {
+        selectUnit(clickedUnit);
+        return;
+      }
+
+      // 4. 點擊藍色／金色可移動落點 -> 執行移動（落子無悔）
+      if (sel && state.reachableMap.has(keyOf(x, y))) {
+        executeMoveTo(x, y);
+        return;
+      }
+
+      updateHoverVisuals();
+      renderInspector();
+      return;
+    }
+
+    if (state.phase === 'POST_MOVE_ATTACK') {
+      if (clickedUnit && state.attackableIds.has(clickedUnit.id)) {
+        executeAttack(clickedUnit);
+        return;
+      }
+      updateHoverVisuals();
+      renderInspector();
+      renderCombatPreview();
+    }
+  }
+
+  function onTileHover(x, y) {
+    if (hoveredTile && hoveredTile.x === x && hoveredTile.y === y) return;
+    hoveredTile = { x, y };
+
+    if (state.phase === 'SELECT_OR_ACT' && state.selectedUnitId) {
+      const rInfo = state.reachableMap.get(keyOf(x, y));
+      previewPath = rInfo ? rInfo.path : [];
+    } else {
+      previewPath = [];
+    }
+
+    // 僅更新 CSS 類別，不觸發 innerHTML 重繪，徹底根治移動游標點擊失效
+    updateHoverVisuals();
+    renderInspector();
+    if (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK') {
+      renderCombatPreview();
+    }
+  }
+
+  /* =========================================================
+   * 十、換邊遮罩、勝負結算與彈窗事件綁定
+   * ========================================================= */
+
+  function openHandoverModal() {
+    const isBlue = state.activeFaction === 'blue';
+    const modal = document.getElementById('handoverModal');
+    const icon = document.getElementById('handoverIcon');
+    const turnText = document.getElementById('handoverTurnText');
+    const title = document.getElementById('handoverTitle');
+    const btn = document.getElementById('btnConfirmHandover');
+
+    icon.textContent = isBlue ? '藍' : '紅';
+    icon.className = isBlue
+      ? 'w-16 h-16 mx-auto mb-4 rounded-2xl bg-blue-600 border-2 border-blue-300 flex items-center justify-center text-3xl font-black text-white shadow-lg'
+      : 'w-16 h-16 mx-auto mb-4 rounded-2xl bg-red-600 border-2 border-red-300 flex items-center justify-center text-3xl font-black text-white shadow-lg';
+
+    turnText.textContent = `回合 ${state.turn} / ${MAX_TURNS}`;
+    title.textContent = `輪到 ${factionName(state.activeFaction)} 行動`;
+    btn.className = isBlue
+      ? 'w-full py-3.5 px-6 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-black text-base shadow-lg transition transform active:scale-95'
+      : 'w-full py-3.5 px-6 rounded-xl bg-red-600 hover:bg-red-500 text-white font-black text-base shadow-lg transition transform active:scale-95';
+
+    modal.classList.remove('hidden');
+  }
+
+  function showVictoryModal() {
+    const modal = document.getElementById('victoryModal');
+    const badge = document.getElementById('victoryBadge');
+    const title = document.getElementById('victoryTitle');
+    const reason = document.getElementById('victoryReason');
+    const stats = document.getElementById('victoryStats');
+
+    if (state.winner === 'blue') {
+      badge.textContent = '藍';
+      badge.className = 'w-16 h-16 mx-auto mb-3 rounded-2xl bg-blue-600 border-2 border-blue-300 flex items-center justify-center text-3xl font-black text-white shadow-lg';
+      title.textContent = '藍方獲勝！';
+    } else if (state.winner === 'red') {
+      badge.textContent = '紅';
+      badge.className = 'w-16 h-16 mx-auto mb-3 rounded-2xl bg-red-600 border-2 border-red-300 flex items-center justify-center text-3xl font-black text-white shadow-lg';
+      title.textContent = '紅方獲勝！';
+    } else {
+      badge.textContent = '和';
+      badge.className = 'w-16 h-16 mx-auto mb-3 rounded-2xl bg-slate-600 border-2 border-slate-300 flex items-center justify-center text-3xl font-black text-white shadow-lg';
+      title.textContent = '雙方平手！';
+    }
+
+    reason.textContent = state.victoryReason;
+
+    const blueAlive = state.units.filter(u => u.alive && u.faction === 'blue');
+    const redAlive = state.units.filter(u => u.alive && u.faction === 'red');
+    const blueHp = blueAlive.reduce((s, u) => s + u.hp, 0);
+    const redHp = redAlive.reduce((s, u) => s + u.hp, 0);
+
+    stats.innerHTML = `
+      <div class="flex justify-between"><span>結束回合：</span><strong class="text-white">回合 ${state.turn} / ${MAX_TURNS}</strong></div>
+      <div class="flex justify-between"><span>藍方存活／總 HP：</span><strong class="text-blue-300">${blueAlive.length} 子／${blueHp} HP</strong></div>
+      <div class="flex justify-between"><span>紅方存活／總 HP：</span><strong class="text-red-300">${redAlive.length} 子／${redHp} HP</strong></div>
+      <div class="flex justify-between"><span>高地格佔領數：</span><strong class="text-amber-300">藍 ${countOccupiedHills('blue')} vs 紅 ${countOccupiedHills('red')}</strong></div>
+    `;
+
+    modal.classList.remove('hidden');
+  }
+
+  function isAnyModalOpen() {
+    const ids = ['handoverModal', 'rulesModal', 'restartModal', 'victoryModal'];
+    return ids.some(id => !document.getElementById(id).classList.contains('hidden'));
+  }
+
+  document.getElementById('btnConfirmHandover').addEventListener('click', () => {
+    document.getElementById('handoverModal').classList.add('hidden');
+    renderAll();
+  });
+
+  document.getElementById('btnEndTurn').addEventListener('click', () => {
+    if (state.phase === 'POST_MOVE_ATTACK') {
+      const sel = state.selectedUnitId ? getUnitById(state.selectedUnitId) : null;
+      if (sel) {
+        addLog(`${factionName(sel.faction)}${UNIT_DEFS[sel.type].name} 放棄攻擊，結束本回合。`, state.activeFaction);
+      }
+      endTurnAndSwitch();
+    } else if (state.phase === 'LOCKED_END') {
+      endTurnAndSwitch();
+    }
+  });
+
+  document.getElementById('btnSkipTurn').addEventListener('click', () => {
+    if (state.phase !== 'SELECT_OR_ACT') return;
+    if (!state.skipConfirmPending) {
+      state.skipConfirmPending = true;
+      renderControls();
+    } else {
+      state.skipConfirmPending = false;
+      addLog(`${factionName(state.activeFaction)} 選擇跳過本回合。`, state.activeFaction);
+      endTurnAndSwitch();
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && !isAnyModalOpen()) {
+      if (state.phase === 'LOCKED_END' || state.phase === 'POST_MOVE_ATTACK') {
+        e.preventDefault();
+        document.getElementById('btnEndTurn').click();
+      }
+    }
+  });
+
+  document.getElementById('btnRules').addEventListener('click', () => {
+    document.getElementById('rulesModal').classList.remove('hidden');
+  });
+  document.getElementById('btnCloseRules').addEventListener('click', () => {
+    document.getElementById('rulesModal').classList.add('hidden');
+  });
+  document.getElementById('rulesModal').addEventListener('click', (e) => {
+    if (e.target.id === 'rulesModal') e.currentTarget.classList.add('hidden');
+  });
+
+  document.getElementById('btnRestart').addEventListener('click', () => {
+    document.getElementById('restartModal').classList.remove('hidden');
+  });
+  document.getElementById('btnCancelRestart').addEventListener('click', () => {
+    document.getElementById('restartModal').classList.add('hidden');
+  });
+  document.getElementById('btnConfirmRestart').addEventListener('click', () => {
+    document.getElementById('restartModal').classList.add('hidden');
+    document.getElementById('victoryModal').classList.add('hidden');
+    initGame();
+  });
+
+  document.getElementById('btnInspectEndBoard').addEventListener('click', () => {
+    document.getElementById('victoryModal').classList.add('hidden');
+  });
+  document.getElementById('btnPlayAgain').addEventListener('click', () => {
+    document.getElementById('victoryModal').classList.add('hidden');
+    initGame();
+  });
+
+  window.addEventListener('DOMContentLoaded', initGame);
+})();
+</script>
+</body>
+</html>
