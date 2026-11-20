@@ -878,6 +878,15 @@
 
     .replay-status { border-color: #334e70; }
 
+    .replay-file-notice {
+      width: 100%;
+      margin-top: 0.5rem;
+      color: #fca5a5;
+      font-size: 0.8rem;
+    }
+
+    #topBar button:disabled { opacity: 0.45; cursor: not-allowed; }
+
     @media (min-width: 1024px) {
       #battleLayout.replaying {
         display: grid;
@@ -947,10 +956,13 @@
           重新開局
         </button>
         <button id="btnReviewGame" class="control-button hidden">對局回放</button>
+        <button id="btnLoadReplay" class="control-button">載入回放</button>
+        <input id="replayFileInput" type="file" class="hidden" tabindex="-1">
         <button id="btnRules" class="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 font-bold text-slate-200 transition">
           規則
         </button>
       </div>
+      <p id="replayFileNotice" class="replay-file-notice hidden" role="status"></p>
     </div>
   </header>
 
@@ -960,7 +972,10 @@
     <section id="replayControls" class="replay-controls hidden" aria-labelledby="replayTitle">
       <div class="replay-toolbar replay-heading">
         <h2 id="replayTitle">對局回放</h2>
-        <button id="btnCloseReplay" class="control-button">回到結算</button>
+        <div class="replay-toolbar">
+          <button id="btnDownloadReplay" class="control-button">下載回放</button>
+          <button id="btnCloseReplay" class="control-button">回到結算</button>
+        </div>
       </div>
       <div class="replay-toolbar" role="group" aria-label="回放視野">
         <button id="replayView-all" class="control-button replay-view" aria-pressed="true">全圖</button>
@@ -1188,7 +1203,10 @@
       <h2 id="victoryTitle" class="text-2xl font-black text-white mb-1">藍方獲勝！</h2>
       <p id="victoryReason" class="text-sm text-amber-300 font-bold mb-4">成功斬首敵方旗手</p>
       <div id="victoryStats" class="bg-slate-950/75 border border-slate-800 rounded-xl p-3 mb-5 text-xs text-slate-300 space-y-1.5 text-left"></div>
-      <button id="btnOpenReplay" data-initial-focus class="control-button replay-primary w-full mb-3">對局回放</button>
+      <div class="grid grid-cols-2 gap-3 mb-3">
+        <button id="btnOpenReplay" data-initial-focus class="control-button replay-primary">對局回放</button>
+        <button id="btnDownloadEndReplay" class="control-button">下載回放</button>
+      </div>
       <div class="grid grid-cols-2 gap-3">
         <button id="btnInspectEndBoard" class="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-100 text-sm font-bold">
           檢視全圖（除迷霧）
@@ -1197,6 +1215,7 @@
           再來一局
         </button>
       </div>
+      <p id="victoryReplayFileNotice" class="replay-file-notice hidden" role="status"></p>
     </div>
   </div>
 
@@ -1297,6 +1316,7 @@
   let currentDifficulty = 'recruit';
   let state = null;
   let replay = null;
+  let replayLoadId = 0;
   let hoveredTile = null;
   let previewPath = [];
   let floatEffects = [];
@@ -1650,7 +1670,7 @@
         previewPath = [];
         updateHoverVisuals();
         renderInspector();
-        if (state && (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK')) {
+        if (state && !replay && (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK')) {
           renderCombatPreview();
         }
       }
@@ -1662,16 +1682,14 @@
   function initGame(mode = currentMode, difficulty = currentDifficulty) {
     pauseReplay();
     replay = null;
+    replayLoadId++;
+    showReplayFileNotice();
     if (state) state.replayFrames.length = 0;
     document.getElementById('replayTurnJump').innerHTML = '';
     document.getElementById('replayTimeline').value = '0';
     document.getElementById('replayTimeline').max = '0';
     document.getElementById('replayProgress').textContent = '1 / 1';
-    cancelAdvancedAiSearch();
-    if (aiTimer !== null) {
-      clearTimeout(aiTimer);
-      aiTimer = null;
-    }
+    cancelRedAiWork();
     currentMode = mode;
     currentDifficulty = difficulty;
     buildBoardDOM();
@@ -1708,7 +1726,8 @@
       replayFrames: [],
       revealAllEndgame: false,
       winner: null,
-      victoryReason: ''
+      victoryReason: '',
+      finishedAt: null
     };
 
     hoveredTile = null;
@@ -2649,15 +2668,12 @@
   }
 
   function triggerGameOver(winner, reason) {
-    cancelAdvancedAiSearch();
-    if (aiTimer) {
-      clearTimeout(aiTimer);
-      aiTimer = null;
-    }
+    cancelRedAiWork();
     state.phase = 'GAME_OVER';
     state.aiThinking = false;
     state.winner = winner;
     state.victoryReason = reason;
+    state.finishedAt = new Date().toISOString();
     state.revealAllEndgame = true;
     state.reachableMap.clear();
     state.attackableIds.clear();
@@ -2701,12 +2717,7 @@
       state.turnNotice = '';
       document.getElementById('board').classList.remove('blue-turn-pulse');
       renderAll();
-      const game = state;
-      aiTimer = setTimeout(() => {
-        if (state !== game) return;
-        aiTimer = null;
-        runRedAiTurn();
-      }, DIFFICULTIES[currentDifficulty].delay);
+      queueRedAiTurn();
     } else {
       state.aiThinking = false;
       const summary = (state.aiTurnSummary || fogDispatch('red')).replace(/。$/, '');
@@ -4410,8 +4421,24 @@
     }
   }
 
+  function cancelRedAiWork() {
+    if (aiTimer !== null) clearTimeout(aiTimer);
+    aiTimer = null;
+    cancelAdvancedAiSearch();
+  }
+
+  function queueRedAiTurn() {
+    const game = state;
+    const pending = setTimeout(() => {
+      if (state !== game || aiTimer !== pending || replay) return;
+      aiTimer = null;
+      runRedAiTurn();
+    }, DIFFICULTIES[currentDifficulty].delay);
+    aiTimer = pending;
+  }
+
   function runRedAiTurn() {
-    if (state.phase === 'GAME_OVER' || state.activeFaction !== 'red' || !isPvE()) return;
+    if (replay || state.phase === 'GAME_OVER' || state.activeFaction !== 'red' || !isPvE()) return;
     const observation = observeRedTurn(currentDifficulty);
     if (isWorkerDifficulty(currentDifficulty)) {
       try {
@@ -4507,10 +4534,238 @@
     }, 1500);
   }
 
+  const REPLAY_FORMAT = 'tactical-fog-chess-replay';
+  const REPLAY_VERSION = 1;
+  const REPLAY_FILE_LIMIT = 8 * 1024 * 1024;
+  const REPLAY_FRAME_LIMIT = 1 + MAX_TURNS * (3 + Math.max(...Object.values(UNIT_DEFS).map(unit => unit.mp)));
+  const REPLAY_FRAME_KINDS = new Set(['opening', 'turn', 'blue', 'red', 'combat', 'ambush', 'victory']);
+  const REPLAY_MARKERS = new Set(['from', 'to', 'alert', 'hit', 'counter']);
+  const REPLAY_TERRAIN = { '.': 'plain', h: 'hill', f: 'forest' };
+  const REPLAY_SIDES = ['blue', 'red'];
+
+  function completedReplay() {
+    if (state.phase !== 'GAME_OVER' || state.replayFrames.length < 2) return null;
+    return {
+      match: { mode: currentMode, difficulty: currentDifficulty, finishedAt: state.finishedAt },
+      frames: state.replayFrames
+    };
+  }
+
+  function encodeReplayFile(record) {
+    const { frames, match } = record;
+    const first = frames[0];
+    const roster = first.units.map(({ id, faction, type, maxHp }) => ({ id, faction, type, maxHp }));
+    const terrainCode = { plain: '.', hill: 'h', forest: 'f' };
+    const map = first.map.map(row => row.map(cell => terrainCode[cell.terrain]).join(''));
+    const encodeMask = mask => mask.map(row => row.map(visible => visible ? '1' : '0').join('')).join('');
+    return JSON.stringify({
+      format: REPLAY_FORMAT, version: REPLAY_VERSION, match, roster, map,
+      frames: frames.map(frame => {
+        const { kind, text, markers, movingUnitId, turn, actingFaction, publicRedForce } = frame;
+        const vision = {};
+        const sightings = {};
+        for (const faction of REPLAY_SIDES) {
+          const sample = frame.visionByFaction[faction];
+          vision[faction] = {
+            tiles: encodeMask(sample.tileVisible),
+            forest: encodeMask(sample.forestReveal),
+            detected: [...sample.detectedEnemyIds]
+          };
+          sightings[faction] = Object.fromEntries(Object.entries(frame.lastSeen[faction])
+            .map(([id, { x, y, turn }]) => [id, [x, y, turn]]));
+        }
+        return {
+          kind, text, markers, movingUnitId, turn, actingFaction, publicRedForce, vision, sightings,
+          units: frame.units.map(({ x, y, hp }) => [x, y, hp])
+        };
+      })
+    });
+  }
+
+  const replayObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const replayTextField = value => typeof value === 'string' && value.length <= 500;
+  const replaySide = value => REPLAY_SIDES.includes(value);
+
+  function checkReplayData(condition) {
+    if (!condition) throw new Error('回放資料有缺漏或損毀。');
+  }
+
+  function decodeReplayFile(source) {
+    let file;
+    try {
+      file = JSON.parse(source.replace(/^\uFEFF/, ''));
+    } catch {
+      throw new Error('檔案無法讀取為 JSON。');
+    }
+    if (!replayObject(file) || file.format !== REPLAY_FORMAT) {
+      throw new Error('請選擇《迷霧陣線》下載的回放檔。');
+    }
+    if (file.version !== REPLAY_VERSION) {
+      throw new Error('這個遊戲版本無法讀取該回放格式。');
+    }
+
+    const { match, roster, map: mapRows, frames: fileFrames } = file;
+    checkReplayData(replayObject(match) && ['pve', 'hotseat'].includes(match.mode)
+      && typeof match.difficulty === 'string' && Object.hasOwn(DIFFICULTIES, match.difficulty)
+      && typeof match.finishedAt === 'string' && match.finishedAt.length <= 40 && Number.isFinite(Date.parse(match.finishedAt)));
+    checkReplayData(Array.isArray(mapRows) && mapRows.length === BOARD_SIZE
+      && mapRows.every(row => typeof row === 'string' && row.length === BOARD_SIZE && /^[.hf]+$/.test(row)));
+    const map = mapRows.map(row => Array.from(row, code => ({ terrain: REPLAY_TERRAIN[code], elev: code === 'h' ? 1 : 0 })));
+
+    const rosterSize = INITIAL_BLUE_UNITS.length * 2;
+    checkReplayData(Array.isArray(roster) && roster.length === rosterSize);
+    const knownUnits = new Map();
+    const pieces = roster.map(unit => {
+      checkReplayData(replayObject(unit) && replaySide(unit.faction) && typeof unit.id === 'string'
+        && /^[BR][1-9]\d?$/.test(unit.id) && unit.id[0] === (unit.faction === 'blue' ? 'B' : 'R')
+        && !knownUnits.has(unit.id) && typeof unit.type === 'string' && Object.hasOwn(UNIT_DEFS, unit.type)
+        && Number.isInteger(unit.maxHp) && unit.maxHp > 0 && unit.maxHp <= 100);
+      const piece = { id: unit.id, faction: unit.faction, type: unit.type, maxHp: unit.maxHp };
+      knownUnits.set(piece.id, piece);
+      return piece;
+    });
+    checkReplayData(pieces.filter(piece => piece.faction === 'red').length * 2 === rosterSize);
+    checkReplayData(Array.isArray(fileFrames) && fileFrames.length >= 2 && fileFrames.length <= REPLAY_FRAME_LIMIT
+      && fileFrames[0]?.kind === 'opening' && fileFrames.at(-1)?.kind === 'victory');
+
+    const intIn = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
+    const coords = (x, y) => intIn(x, 0, BOARD_SIZE - 1) && intIn(y, 0, BOARD_SIZE - 1);
+    const readMask = mask => {
+      checkReplayData(typeof mask === 'string' && mask.length === BOARD_SIZE ** 2 && /^[01]+$/.test(mask));
+      return Array.from({ length: BOARD_SIZE }, (_, y) => Array.from({ length: BOARD_SIZE }, (_, x) => mask[y * BOARD_SIZE + x] === '1'));
+    };
+    let lastTurn = 1;
+    const frames = fileFrames.map(frame => {
+      checkReplayData(replayObject(frame) && REPLAY_FRAME_KINDS.has(frame.kind)
+        && intIn(frame.turn, lastTurn, MAX_TURNS) && replaySide(frame.actingFaction)
+        && Array.isArray(frame.units) && frame.units.length === pieces.length
+        && Array.isArray(frame.markers) && frame.markers.length <= 2
+        && replayObject(frame.vision) && replayObject(frame.sightings));
+      lastTurn = frame.turn;
+      const units = frame.units.map((entry, index) => {
+        const piece = pieces[index];
+        checkReplayData(Array.isArray(entry) && entry.length === 3 && coords(entry[0], entry[1]) && intIn(entry[2], 0, piece.maxHp));
+        const [x, y, hp] = entry;
+        return { ...piece, x, y, hp, alive: hp > 0 };
+      });
+      const livingIds = new Set(units.filter(unit => unit.alive).map(unit => unit.id));
+      checkReplayData(frame.movingUnitId === null || livingIds.has(frame.movingUnitId));
+      let text = frame.text;
+      if (!replayTextField(text)) {
+        checkReplayData(replayObject(text) && ['all', ...REPLAY_SIDES].every(view => replayTextField(text[view])));
+        text = { all: text.all, blue: text.blue, red: text.red };
+      }
+      const markers = frame.markers.map(marker => {
+        checkReplayData(replayObject(marker) && coords(marker.x, marker.y) && REPLAY_MARKERS.has(marker.kind)
+          && replayTextField(marker.label) && Array.isArray(marker.viewers)
+          && marker.viewers.length > 0 && marker.viewers.length <= 2 && marker.viewers.every(replaySide));
+        const { x, y, kind, label, viewers } = marker;
+        return { x, y, kind, label, viewers };
+      });
+      const visionByFaction = {};
+      const lastSeen = {};
+      for (const side of REPLAY_SIDES) {
+        const vision = frame.vision[side];
+        const sightings = frame.sightings[side];
+        const enemySide = opponentOf(side);
+        checkReplayData(replayObject(vision) && Array.isArray(vision.detected) && vision.detected.length <= rosterSize / 2
+          && vision.detected.every(id => knownUnits.get(id)?.faction === enemySide && livingIds.has(id))
+          && replayObject(sightings));
+        visionByFaction[side] = {
+          tileVisible: readMask(vision.tiles),
+          forestReveal: readMask(vision.forest),
+          detectedEnemyIds: new Set(vision.detected)
+        };
+        lastSeen[side] = Object.fromEntries(Object.entries(sightings).map(([id, entry]) => {
+          const unit = knownUnits.get(id);
+          checkReplayData(unit?.faction === enemySide && Array.isArray(entry) && entry.length === 3
+            && coords(entry[0], entry[1]) && intIn(entry[2], 1, frame.turn));
+          const [x, y, turn] = entry;
+          return [id, { x, y, turn, faction: unit.faction, type: unit.type }];
+        }));
+      }
+      const livingRed = units.filter(unit => unit.faction === 'red' && unit.alive);
+      const publicRedForce = { units: livingRed.length, hp: livingRed.reduce((sum, unit) => sum + unit.hp, 0) };
+      checkReplayData(replayObject(frame.publicRedForce) && frame.publicRedForce.units === publicRedForce.units
+        && frame.publicRedForce.hp === publicRedForce.hp);
+      return {
+        kind: frame.kind, text, markers, movingUnitId: frame.movingUnitId, turn: frame.turn,
+        actingFaction: frame.actingFaction, map, units, visionByFaction, lastSeen, publicRedForce
+      };
+    });
+    return { match: { mode: match.mode, difficulty: match.difficulty, finishedAt: match.finishedAt }, frames };
+  }
+
+  const HTML_TEXT_ENTITIES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const escapeHtmlText = text => text.replace(/[&<>"']/g, character => HTML_TEXT_ENTITIES[character]);
+
+  function showReplayFileNotice(message = '') {
+    const target = visibleModal()?.id === 'victoryModal' ? 'victoryReplayFileNotice' : 'replayFileNotice';
+    for (const id of ['replayFileNotice', 'victoryReplayFileNotice']) {
+      const notice = document.getElementById(id);
+      notice.textContent = id === target ? message : '';
+      notice.classList.toggle('hidden', !notice.textContent);
+    }
+  }
+
+  function downloadReplay() {
+    const record = replay?.record || completedReplay();
+    if (!record) return;
+    showReplayFileNotice();
+
+    let uri;
+    try {
+      const date = new Date(record.match.finishedAt);
+      const pad = value => String(value).padStart(2, '0');
+      const day = [date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join('');
+      const time = [date.getHours(), date.getMinutes(), date.getSeconds()].map(pad).join('');
+      const label = record.match.mode === 'hotseat' ? '雙人' : DIFFICULTIES[record.match.difficulty].name;
+      const file = new Blob([encodeReplayFile(record)], { type: 'application/json' });
+      uri = URL.createObjectURL(file);
+      const link = document.createElement('a');
+      link.href = uri;
+      link.download = `迷霧陣線-${day}-${time}-${label}.tfc-replay.json`;
+      document.body.appendChild(link);
+      try { link.click(); }
+      finally { link.remove(); }
+    } catch {
+      showReplayFileNotice('無法下載回放，請再試一次。');
+    } finally {
+      if (uri) setTimeout(() => URL.revokeObjectURL(uri), 1000);
+    }
+  }
+
+  async function importReplayFile(file) {
+    if (!file) return;
+    const attempt = ++replayLoadId;
+    const game = state;
+    const playback = replay;
+    const isCurrent = () => replayLoadId === attempt && state === game && replay === playback;
+    showReplayFileNotice();
+    let record;
+    try {
+      if (file.size > REPLAY_FILE_LIMIT) throw new Error('檔案太大，請確認選的是單局回放。');
+      let source;
+      try { source = await file.text(); }
+      catch { throw new Error('無法讀取檔案，請重新選取。'); }
+      if (!isCurrent()) return;
+      record = decodeReplayFile(source);
+    } catch (error) {
+      if (isCurrent()) showReplayFileNotice(error.message);
+      return;
+    }
+    const modal = visibleModal();
+    if (modal && modal.id !== 'victoryModal') {
+      showReplayFileNotice('請先關閉目前的視窗，再載入回放。');
+      return;
+    }
+    startReplay(record, true);
+  }
+
   const REPLAY_VIEW_NAMES = { all: '全圖', blue: '藍方視野', red: '紅方視野' };
 
   function getBoardView() {
-    const frame = replay ? state.replayFrames[replay.index] : null;
+    const frame = replay ? replay.record.frames[replay.index] : null;
     const board = frame || state;
     const faction = frame && replay.view !== 'all' ? replay.view : (frame?.actingFaction || getViewerFaction());
     const showAll = frame ? replay.view === 'all' : state.revealAllEndgame;
@@ -4524,18 +4779,28 @@
   }
 
   function openReplay() {
-    if (state.phase !== 'GAME_OVER' || !state.replayFrames.length || replay) return;
+    const record = completedReplay();
+    if (record && !replay) startReplay(record, false);
+  }
+
+  function startReplay(record, imported) {
+    const modal = visibleModal();
+    const returnToVictory = !imported || replay?.returnToVictory || modal?.id === 'victoryModal';
+    const resumeAi = Boolean(replay?.resumeAi || (imported && isPvE() && state.aiThinking && state.activeFaction === 'red'));
+    pauseReplay();
+    if (resumeAi) cancelRedAiWork();
     const turnIndex = new Map();
-    for (const [index, frame] of state.replayFrames.entries()) {
+    for (const [index, frame] of record.frames.entries()) {
       if (!turnIndex.has(frame.turn)) turnIndex.set(frame.turn, index);
     }
-    replay = { index: 0, view: 'all', speed: 1, playing: false, timer: null, turnIndex };
+    replay = { record, imported, returnToVictory, resumeAi, index: 0, view: 'all', speed: 1, playing: false, timer: null, turnIndex };
     hoveredTile = null;
     previewPath = [];
+    document.getElementById('board').classList.remove('blue-turn-pulse');
 
     const turnJump = document.getElementById('replayTurnJump');
     turnJump.innerHTML = Array.from(turnIndex, ([turn]) => `<option value="${turn}">第 ${turn} 回合</option>`).join('');
-    if (visibleModal()?.id === 'victoryModal') setModalOpen('victoryModal', false);
+    if (modal?.id === 'victoryModal') setModalOpen('victoryModal', false);
     renderAll();
     document.getElementById('btnReplayPlay').focus();
   }
@@ -4549,18 +4814,23 @@
 
   function closeReplay() {
     if (!replay) return;
+    const { returnToVictory, resumeAi, imported } = replay;
     pauseReplay();
     replay = null;
+    replayLoadId++;
     hoveredTile = null;
     previewPath = [];
+    showReplayFileNotice();
     renderAll();
-    showVictoryModal();
+    if (returnToVictory && state.phase === 'GAME_OVER') showVictoryModal();
+    else if (imported) document.getElementById('btnLoadReplay').focus({ preventScroll: true });
+    if (resumeAi && isPvE() && state.aiThinking && state.activeFaction === 'red') queueRedAiTurn();
   }
 
   function seekReplay(index) {
     if (!replay || !Number.isInteger(index)) return;
     pauseReplay();
-    replay.index = Math.min(state.replayFrames.length - 1, Math.max(0, index));
+    replay.index = Math.min(replay.record.frames.length - 1, Math.max(0, index));
     renderAll();
   }
 
@@ -4577,17 +4847,17 @@
       if (replay !== playback || state !== game || !playback.playing) return;
       playback.timer = null;
       playback.index++;
-      if (playback.index >= game.replayFrames.length - 1) pauseReplay();
+      if (playback.index >= playback.record.frames.length - 1) pauseReplay();
       renderAll();
       if (playback.playing) scheduleReplayStep(playback);
     }, 580 / playback.speed);
   }
 
   function toggleReplayPlayback() {
-    if (!replay || state.replayFrames.length <= 1 || isAnyModalOpen()) return;
+    if (!replay || replay.record.frames.length <= 1 || isAnyModalOpen()) return;
     if (replay.playing) pauseReplay();
     else {
-      if (replay.index === state.replayFrames.length - 1) replay.index = 0;
+      if (replay.index === replay.record.frames.length - 1) replay.index = 0;
       replay.playing = true;
       scheduleReplayStep(replay);
     }
@@ -4602,10 +4872,16 @@
     document.getElementById('btnReviewGame').classList.toggle('hidden', state.phase !== 'GAME_OVER' || Boolean(replay));
     const subtitle = document.getElementById('logSubtitle');
     subtitle.textContent = replay ? REPLAY_VIEW_NAMES[replay.view] : (isPvE() ? '藍方視角' : '當前行動方視角');
+    const viewingFile = Boolean(replay?.imported);
+    document.getElementById('aiDifficulty').disabled = !isPvE() || viewingFile;
+    document.getElementById('btnModeHotseat').disabled = viewingFile;
+    document.getElementById('btnRestart').disabled = viewingFile;
     if (!replay) return;
 
-    const frame = state.replayFrames[replay.index];
-    const end = state.replayFrames.length - 1;
+    document.getElementById('btnCloseReplay').textContent = viewingFile ? '返回遊戲' : '回到結算';
+    const { frames } = replay.record;
+    const frame = frames[replay.index];
+    const end = frames.length - 1;
     const atEnd = replay.index === end;
     const slider = document.getElementById('replayTimeline');
     slider.max = String(end);
@@ -4653,6 +4929,7 @@
 
   function renderHeaderAndBanner(view = getBoardView()) {
     const { board, frame, faction: viewer, showAll } = view;
+    const mode = frame ? replay.record.match.mode : currentMode;
     document.getElementById('turnBadge').textContent = frame?.kind === 'opening'
       ? '開局'
       : `第 ${board.turn} / ${MAX_TURNS} 回合`;
@@ -4680,7 +4957,7 @@
       const isFull = faction === viewer || showAll;
       const hp = units.reduce((total, unit) => total + unit.hp, 0);
       const hills = units.filter(unit => board.map[unit.y][unit.x].terrain === 'hill').length;
-      const publicTotals = isPvE() && viewer === 'blue' && faction === 'red' && !showAll ? board.publicRedForce : null;
+      const publicTotals = mode === 'pve' && viewer === 'blue' && faction === 'red' && !showAll ? board.publicRedForce : null;
       const summary = publicTotals ? `紅 ${publicTotals.units} 子 / HP ${publicTotals.hp}`
         : (isFull ? `${name} ${units.length} 子 / HP ${hp}` : `${name} 已見 ${units.length} 子`);
       document.getElementById(faction === 'blue' ? 'topBlueSummary' : 'topRedSummary').textContent = summary;
@@ -4895,7 +5172,7 @@
             </div>
           `;
 
-          if (!state.aiThinking && (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK') && state.attackableIds.has(unit.id)) {
+          if (!frame && !state.aiThinking && (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK') && state.attackableIds.has(unit.id)) {
             classes.push('tile-attackable');
           }
         } else if (ghostAt.has(k)) {
@@ -4914,7 +5191,7 @@
           for (const marker of markers) {
             if (marker.x !== x || marker.y !== y) continue;
             html += `<div class="replay-marker replay-marker-${marker.kind}" aria-hidden="true">${marker.label
-              ? `<span class="replay-marker-label">${marker.label}</span>` : ''}</div>`;
+              ? `<span class="replay-marker-label">${escapeHtmlText(marker.label)}</span>` : ''}</div>`;
           }
         } else {
           for (const fx of floatEffects) {
@@ -4938,7 +5215,7 @@
     const pathSet = new Set();
     let endKey = null;
 
-    if (state && state.phase === 'SELECT_OR_ACT' && selUnit && previewPath.length > 1) {
+    if (!replay && state && state.phase === 'SELECT_OR_ACT' && selUnit && previewPath.length > 1) {
       for (let i = 1; i < previewPath.length; i++) {
         pathSet.add(keyOf(previewPath[i].x, previewPath[i].y));
       }
@@ -5021,7 +5298,7 @@
       : `<span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">戰爭迷霧</span>`;
 
     let movePreviewHtml = '';
-    if (!state.aiThinking && state.phase === 'SELECT_OR_ACT' && state.selectedUnitId && state.reachableMap.has(keyOf(x, y))) {
+    if (!frame && !state.aiThinking && state.phase === 'SELECT_OR_ACT' && state.selectedUnitId && state.reachableMap.has(keyOf(x, y))) {
       const sel = getUnitById(state.selectedUnitId);
       const rInfo = state.reachableMap.get(keyOf(x, y));
       const disp = manhattan(sel.x, sel.y, x, y);
@@ -5184,7 +5461,7 @@
   function replayBattleLog() {
     const entries = [];
     for (let index = replay.index; index >= 0; index--) {
-      const frame = state.replayFrames[index];
+      const frame = replay.record.frames[index];
       if (frame.kind === 'turn') continue;
       const text = replayText(frame, replay.view);
       if (!text) continue;
@@ -5214,7 +5491,7 @@
       return `
         <div class="bg-slate-950/65 border border-slate-800/80 rounded px-2 py-1.5 leading-snug">
           <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold mr-1.5 ${badgeCls}">R${item.turn}</span>
-          <span class="${textCls}">${text}</span>
+          <span class="${textCls}">${escapeHtmlText(text)}</span>
         </div>
       `;
     }).join('');
@@ -5309,7 +5586,7 @@
     if (hoveredTile && hoveredTile.x === x && hoveredTile.y === y) return;
     hoveredTile = { x, y };
 
-    if (!state.aiThinking && state.phase === 'SELECT_OR_ACT' && state.selectedUnitId) {
+    if (!replay && !state.aiThinking && state.phase === 'SELECT_OR_ACT' && state.selectedUnitId) {
       const rInfo = state.reachableMap.get(keyOf(x, y));
       previewPath = rInfo ? rInfo.path : [];
     } else {
@@ -5319,7 +5596,7 @@
     // 絕不重建 #board，僅切換 CSS class
     updateHoverVisuals();
     renderInspector();
-    if (!state.aiThinking && (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK')) {
+    if (!replay && !state.aiThinking && (state.phase === 'SELECT_OR_ACT' || state.phase === 'POST_MOVE_ATTACK')) {
       renderCombatPreview();
     }
   }
@@ -5419,6 +5696,7 @@
   }
 
   function requestGameChange(mode, difficulty, restart = false) {
+    if (replay?.imported) return;
     const modeChanged = mode !== currentMode;
     if (!restart && !modeChanged && difficulty === currentDifficulty) return;
     if (state.phase === 'GAME_OVER' || (!restart && !state.hasStarted)) {
@@ -5500,7 +5778,7 @@
   });
 
   document.getElementById('btnEndTurn').addEventListener('click', () => {
-    if (state.aiThinking || isAnyModalOpen()) return;
+    if (replay || state.aiThinking || isAnyModalOpen()) return;
     if (state.phase === 'POST_MOVE_ATTACK') {
       const unit = getUnitById(state.selectedUnitId);
       if (unit) {
@@ -5515,7 +5793,7 @@
   });
 
   document.getElementById('btnSkipTurn').addEventListener('click', () => {
-    if (state.phase !== 'SELECT_OR_ACT' || state.aiThinking || isAnyModalOpen()) return;
+    if (replay || state.phase !== 'SELECT_OR_ACT' || state.aiThinking || isAnyModalOpen()) return;
     if (!state.skipConfirmPending) {
       state.skipConfirmPending = true;
       renderControls();
@@ -5536,7 +5814,7 @@
       else if (!modal && replay) closeReplay();
       return;
     }
-    if (event.code !== 'Space' || isAnyModalOpen() || state.aiThinking) return;
+    if (replay || event.code !== 'Space' || isAnyModalOpen() || state.aiThinking) return;
     if (event.target.closest('button, input, select, textarea, summary') && event.target.id !== 'btnEndTurn') return;
     if (state.phase === 'LOCKED_END' || state.phase === 'POST_MOVE_ATTACK') {
       event.preventDefault();
@@ -5560,6 +5838,17 @@
     if (event.target === event.currentTarget) dismissConfirmation();
   });
 
+  const replayFileInput = document.getElementById('replayFileInput');
+  document.getElementById('btnLoadReplay').addEventListener('click', () => {
+    if (!isAnyModalOpen()) replayFileInput.click();
+  });
+  replayFileInput.addEventListener('change', () => {
+    const file = replayFileInput.files[0];
+    replayFileInput.value = '';
+    importReplayFile(file);
+  });
+  document.getElementById('btnDownloadReplay').addEventListener('click', downloadReplay);
+  document.getElementById('btnDownloadEndReplay').addEventListener('click', downloadReplay);
   document.getElementById('btnOpenReplay').addEventListener('click', openReplay);
   document.getElementById('btnReviewGame').addEventListener('click', openReplay);
   document.getElementById('btnCloseReplay').addEventListener('click', closeReplay);
