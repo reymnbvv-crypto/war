@@ -125,9 +125,7 @@
 
 ---
 
-## 七、未來開發與維護注意事項
+## 七、開發規範與專案進度
 
-- **保持地圖對稱性**：若修改 `HILL_COORDS`、`FOREST_COORDS` 或 `INITIAL_BLUE_UNITS`，務必維持 `(x, y) ↔ (9 - x, 9 - y)` 中心對稱，否則 180° 鏡像適配層會產生不對稱偏差。
-- **Worker 序列化隔離**：`searchAdvancedAi` 與 `searchWargodShard` 會透過 `.toString()` 注入 Blob Worker，函式內部**禁止閉包引用外層全域變數或輔助函式**，所有相依資料必須經由 `packet` 傳入。
-- **零作弊原則**：任何 AI 新增邏輯只能使用 `observeAiTurn(faction, difficulty)` 產出的合法觀測與該陣營獨立記憶，切勿直接讀取 `state.units` 中的隱藏敵軍。
-- **回放相容性**：新增難度鍵值至 `DIFFICULTIES` 或調整規則欄位時，同步檢查 `encodeReplayFile` / `decodeReplayFile` 與 `REPLAY_FRAME_LIMIT`。
+- **開發紅線、驗證清單與協作流程**：請參閱 [`AGENTS.md`](./AGENTS.md)（涵蓋零作弊隔離、180° 對稱不變量、Blob Worker 序列化隔離、既有 AI 難度鎖定原則與交付流程）。
+- **版本里程碑、設計決策與 AI 基準測試帳本**：請參閱 [`PROGRESS.md`](./PROGRESS.md)（收錄軍神 vs 元帥實測、五難度鏡像先後手測試與四難度 BO6 循環賽數據）。
