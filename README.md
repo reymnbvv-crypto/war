@@ -1,6 +1,6 @@
 # 迷霧陣線｜Tactical Fog Chess
 
-無外部相依的單頁 10×10 戰爭迷霧回合制戰術戰棋遊戲（純 HTML / CSS / Vanilla JS，單檔部署於 `index.html`）。
+零外部套件、零建置鏈的 10×10 戰爭迷霧回合制戰術戰棋遊戲（純 HTML / CSS / Vanilla JS），採用**核心引擎與 AI 演算法完全分離的單檔熱插拔架構（TFC AI Protocol v1）**。
 
 ---
 
@@ -8,8 +8,12 @@
 
 本專案無需安裝套件或建置步驟：
 
-1. 直接用現代瀏覽器開啟 `index.html`，或以任意靜態伺服器啟動（例如 `python3 -m http.server 8080` 後瀏覽 `http://localhost:8080`）。
-2. 建議以 HTTP 本地伺服器開啟，可讓高階 AI（將軍／元帥／軍神）正常啟用內嵌 Blob Web Worker 平行推演；若於 `file://` 環境受限，系統會自動退回主執行緒時間切片模式運作，不影響可玩性。
+1. **建議以本地靜態伺服器啟動**（例如 `python3 -m http.server 8080` 後瀏覽 `http://localhost:8080`）：
+   - 網頁會自動探索載入 [`ai/`](./ai/) 資料夾中全部 `*.js` 演算法（不需維護任何清單檔），並啟用高階 AI 的內嵌 Blob Web Worker 平行推演。
+2. **直接雙擊 `index.html`（`file://` 環境）**：
+   - 因瀏覽器安全限制無法自動掃描本地資料夾，遊戲將以雙人熱座啟動並保留回放播放功能；您可直接點頂部「**匯入 AI**」一次多選或分次載入本機 `.js` 演算法檔（僅本次分頁有效，不改動原儲存庫），高階 AI 會自動退回主執行緒時間切片模式運作。
+3. **線上 GitHub Pages 部署**：
+   - 內建 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml)，於發佈產物自動掃描 `ai/*.js` 產生 `ai/manifest.json`，不回寫 `main` 分支。
 
 ---
 
@@ -61,71 +65,87 @@
 
 ## 三、對戰模式與介面功能
 
-1. **人機對戰（`pve`）**：玩家執藍方先手對戰紅方 AI，支援 5 種 AI 難度與操作後自動換邊。
-2. **雙人熱座（`hotseat`）**：同機藍紅雙人輪流行動，換邊時啟用全螢幕隱私遮罩防止偷看迷霧。
+1. **人機對戰（`pve`）**：玩家執藍方先手對戰紅方 AI，支援所有已載入的演算法與操作後自動換邊。
+2. **雙人熱座（`hotseat`）**：同機藍紅雙人輪流行動，換邊時啟用全螢幕隱私遮罩防止偷看迷霧；當無任何 AI 演算法時亦開箱可玩。
 3. **AI 對弈（`aivai`）**：
-   - 可分別自由指定**藍方 AI** 與**紅方 AI** 的演算法（允許相同難度鏡像對打）。
-   - 開局與重開後停在**待命狀態**，方便先選好雙方演算法與初始視野，再點擊「開始對弈」或「單步推進」。
-   - 內建與回放一致的**三視野即時切換**（預設**全圖**，隨時可切至**藍方視野**或**紅方視野**，包含 AI 思考途中），同步更新棋盤迷霧、兵力摘要、行動軌跡、檢視器與防洩漏戰報。
-   - 支援「暫停／繼續」、「單步推進」與「節奏速度（標準／快速）」。
-4. **統一思考計時提示**：所有 AI 難度推演超過 **3 秒** 時，狀態列自動顯示已思考秒數（如 `紅方（軍神）極限推演中… 6s`）。
+   - 可分別自由指定**藍方 AI** 與**紅方 AI** 的演算法（允許相同難度鏡像對打，或兩支以上匯入演算法互打）。
+   - 開局與重開後停在**待命狀態**，預設**全圖**視野，隨時可切換全圖／藍方／紅方三視野（包含 AI 思考途中與終局檢視），支援「暫停／繼續」、「單步推進」與「節奏速度（標準／快速）」。
+4. **多檔網頁匯入 AI 與規範下載**：
+   - 頂部「**匯入 AI**」支援一次多選或分次累加 `.js` 演算法檔（僅限本次分頁有效，關閉即清空、不修改儲存庫）；同檔名重匯入採熱更新覆蓋，不同檔名但相同 `id` 會自動區隔編號供同台對戰。
+   - 「**規則**」彈窗內建「**下載 `AI_PROTOCOL.md`**」按鈕，方便人類開發者或 AI 從零撰寫自製演算法。
+5. **統一思考計時提示**：所有 AI 難度推演超過 **3 秒** 時，狀態列自動顯示已思考秒數（如 `紅方（軍神）極限推演中… 6s`）。
 
 ---
 
-## 四、五段式 AI 演算法架構（嚴格零作弊）
+## 四、單檔熱插拔 AI 演算法架構（嚴格零作弊）
 
-所有難度皆**嚴格僅讀取自身陣營的合法視野與記憶**，絕不偷看對手隱藏座標；並透過 **180° 中心鏡像適配層** 讓同一套規範化引擎無縫擔任藍方或紅方，雙陣營的情報帳本、信念分布與粒子濾波器彼此完全隔離。
+所有演算法皆以**單一完全自包含 `.js` 檔**存放於 [`ai/`](./ai/)，透過 [`core/ai-host.js`](./core/ai-host.js) 的迷霧防火牆（`FogFirewall`）與 180° 規範化適配層接入，雙陣營每局皆獨立建立實例、徹底物理隔離。
 
-| 難度鍵值 | 名稱 | 核心技術 | 時間特性 |
-|---|---|---|---|
-| `recruit` | **新兵 · 單步評估** | 單層戰術評分（`scoreCandidateAction`）＋前 4 手機率抽樣 | ~0.35s |
-| `warrior` | **戰士 · 預判回應** | 動態戰術姿態（進攻/防禦/偵察/僵持破局）＋記憶殘影＋前 12 手 2-Ply 反擊前瞻 | ~0.45s |
-| `general` | **將軍 · 迷霧推演** | 單子邊際信念更新＋4 世界抽樣＋迭代加深 Alpha-Beta（至 Depth 3 + Q1）＋單 Worker | ~0.6s |
-| `marshal` | **元帥 · 深度推演** | 12 世界抽樣（含 25% 高風險世界）＋Alpha-Beta（至 Depth 5～8 + Q3～5）＋64K 置換表＋單 Worker | ~3s |
-| `wargod` | **軍神 · 極限推演** | **聯合粒子濾波器（192 粒子，單子合法推進＋迷霧遭襲反推）**＋2～4 並行 Worker Pool＋分層世界（12～20 世界；敵全見時收斂至 1 精確世界並啟用無損根部剪枝）＋兩階段篩選（28→10 手，二階段預熱置換表）＋**PVS / Aspiration Windows / LMR / Futility / Killer / History / 256K 獨立置換表 / 強化 Quiescence**＋CVaR 風險評估＋獨立資訊價值（VOI）＋全向衝鋒／旗手安全／夾擊／多目標威脅／隱蔽／平滑終局時鐘評估＋**克制型殘局跳過機制** | **動態 1～20s**（必走／平靜 1～4s、交戰 5～9s、關鍵／殘局自動長考至 12～20s，硬上限 ~21.5s） |
+- **增減演算法僅動 1 檔**：放進 `ai/xxx.js` 即自動載入、刪除即移除，無須改動本體或任何清單檔。
+- **建立「全新無演算法版本」**：直接刪空 `ai/*.js` 即得 100% 純淨白板版（本體 [`core/engine.js`](./core/engine.js) 僅含純規則、零 `aiValue` 與啟發式，開箱可熱座與播回放）。
 
-> 註：`general` 與 `marshal` 的推演函式（`searchAdvancedAi`）完全獨立於 `wargod`（`searchWargodShard`），修改軍神時不會影響原有四難度的棋力表現。
+### 內附五階演算法（[`ai/`](./ai/)）
 
----
-
-## 五、對局回放格式（`.tfc-replay.json`）
-
-對局結束後可檢視局後回放、下載 `.tfc-replay.json` 或於任意時刻載入歷史回放檔（支援全圖／藍方／紅方三視野、時間軸拖曳、回合跳轉、1×/2× 播放）。
-
-- `format`: `"tactical-fog-chess-replay"`
-- `version`: `1`
-- `match`:
-  - `mode`: `"pve"` | `"hotseat"` | `"aivai"`
-  - `difficulty`: 紅方（或主要）難度鍵值（`recruit` | `warrior` | `general` | `marshal` | `wargod`）
-  - `blueDifficulty` / `redDifficulty`：僅 `mode === "aivai"` 時附加，記錄藍紅雙方演算法（完全向下相容舊版 `pve` / `hotseat` 回放檔）
-  - `finishedAt`: ISO 8601 時間字串
-- `roster`: 16 枚棋子的編制（`id`, `faction`, `type`, `maxHp`）
-- `map`: 10×10 地形編碼（`.` 平地、`h` 高地、`f` 樹林）
-- `frames`: 逐幀快照陣列，含每步的單位座標血量、雙陣營視野與林內揭露遮罩、殘影、戰報三視角文字與標記。
+| 檔案 | 難度鍵值 | 名稱 | 核心技術 | 時間特性 |
+|---|---|---|---|---|
+| [`ai/recruit.js`](./ai/recruit.js) | `recruit` | **新兵 · 單步評估** | 單層戰術評分＋前 4 手機率抽樣 | ~0.35s |
+| [`ai/warrior.js`](./ai/warrior.js) | `warrior` | **戰士 · 預判回應** | 動態戰術姿態＋記憶殘影＋前 12 手 2-Ply 反擊前瞻 | ~0.45s |
+| [`ai/general.js`](./ai/general.js) | `general` | **將軍 · 迷霧推演** | 單子邊際信念＋4 世界抽樣＋Alpha-Beta（至 Depth 3 + Q1）＋單 Worker | ~0.6s |
+| [`ai/marshal.js`](./ai/marshal.js) | `marshal` | **元帥 · 深度推演** | 12 世界抽樣（含 25% 高風險世界）＋Alpha-Beta（至 Depth 5～8 + Q3～5）＋64K TT＋單 Worker | ~3s |
+| [`ai/wargod.js`](./ai/wargod.js) | `wargod` | **軍神 · 極限推演** | 192 粒子濾波（單子推進＋迷霧遭襲反推）＋2～4 Worker Pool＋PVS / Aspiration Windows / LMR / Futility / 256K TT / CVaR / VOI＋動態 1～20s 長考＋克制型殘局跳過 | **動態 1～20s**（硬上限 ~21.5s） |
 
 ---
 
-## 六、程式碼架構導覽（`index.html`）
+## 五、自製 AI 開發與命令列驗證工具（Node.js ≥ 18，零相依）
 
-`index.html` 採單一 IIFE 封裝，由上而下依序為：
+完整協議、規則公式、唯讀 Rules SDK 與最小空殼範本請見 [`AI_PROTOCOL.md`](./AI_PROTOCOL.md)。
 
-1. **樣式區（`<style>`）**：棋盤格、高地／樹林／迷霧／ZoC／軌跡／動畫、工具類、回放列與觀戰面板樣式。
-2. **版面區（`<body>`）**：頂部控制列（模式、藍／紅 AI 選單、音效、重開、回放、規則）、主戰場雙欄（棋盤＋右側觀戰／指揮／預測／檢視／戰報／速查）與四個彈窗（換邊、規則、結算、重開確認）。
-3. **腳本區（`<script>`）**：
-   - **一、核心常數**：`BOARD_SIZE`、`MAX_TURNS`、`HILL_COORDS`、`FOREST_COORDS`、`UNIT_DEFS`、`INITIAL_BLUE_UNITS`。
-   - **二、全域狀態、180° 鏡像適配與粒子濾波**：`DIFFICULTIES`、規範化座標轉換（`canonicalCoord` / `canonicalVision` / `fromCanonicalAction`）、`advancedGeometryFor`、舊版信念（`advanceEnemyBeliefsFor`）、軍神粒子濾波器（`advanceParticlesFor` / `filterParticlesFor`）、靜態棋盤建構（`buildBoardDOM`）與 `initGame`。
-   - **三～五、規則引擎**：DDA 射線 `hasLineOfSight`、`computeVisionData`、`isInEnemyShieldZoc`、Dijkstra 尋路 `computeReachableFor`、射程與布陣 `previewCombat`。
-   - **六、回合流轉**：`performMoveStepByStep`、`resolveCombat`、`checkVictoryAfterAction`、`checkTurnLimitVictory`、`endTurnAndSwitch`。
-   - **七、AI 引擎**：
-     - 新兵／戰士：`buildAiStrategicContext`、`scoreCandidateAction`、`evaluateTwoPlyEnemyBestReply`、`chooseRedAiAction`
-     - 將軍／元帥：`searchAdvancedAi`、`advancedSearchPacket`、`startAdvancedAiSearch`
-     - 軍神：`searchWargodShard`、`wargodSearchPacket`、`aggregateWargodScores`、`startWargodAiSearch`
-     - 排程與執行：`beginAiTurn`、`startThinkingClock`、`runAiTurn`、`executeAiAction`
-   - **八～十、回放、渲染與互動**：`encodeReplayFile` / `decodeReplayFile`、`getBoardView`、`renderSpectatorPanel`、`renderBoard`（不銷毀 `.tile` 節點，懸停僅切換 CSS class）、`renderInspector`、`renderBattleLog`、互動與彈窗綁定。
+```bash
+# 驗證 ai/ 內全部演算法（協議契約 + 合法步 + Worker 沙盒 + 迷霧零作弊審計）
+node tools/verify-ai.mjs
+
+# 驗證單一自製演算法檔
+node tools/verify-ai.mjs ai/my_bot.js
+
+# 兩支演算法藍紅交替無頭對戰
+node tools/arena.mjs --blue ai/marshal.js --red ai/wargod.js --games 4 --swap
+
+# 針對 ai/ 內全部演算法跑單循環賽
+node tools/arena.mjs --round-robin --games 2
+```
 
 ---
 
-## 七、開發規範與專案進度
+## 六、對局回放格式（`.tfc-replay.json`）
 
-- **開發紅線、驗證清單與協作流程**：請參閱 [`AGENTS.md`](./AGENTS.md)（涵蓋零作弊隔離、180° 對稱不變量、Blob Worker 序列化隔離、既有 AI 難度鎖定原則與交付流程）。
-- **版本里程碑、設計決策與 AI 基準測試帳本**：請參閱 [`PROGRESS.md`](./PROGRESS.md)（收錄軍神 vs 元帥實測、五難度鏡像先後手測試與四難度 BO6 循環賽數據）。
+對局結束後可檢視局後回放、下載 `.tfc-replay.json` 或於任意時刻（含 0 演算法狀態）載入歷史回放檔：
+
+- `format`: `"tactical-fog-chess-replay"`、`version`: `1`
+- `match`：`mode`（`"pve"` | `"hotseat"` | `"aivai"`）、`difficulty`、`blueDifficulty` / `redDifficulty`（`aivai`）、選填 `difficultyNames`、`finishedAt`（完全向下相容舊版 v1 回放與未安裝的自訂演算法 `id`）
+- `roster` / `map` / `frames`：16 枚棋子編制、10×10 地形與逐幀三視角快照。
+
+---
+
+## 七、專案結構與文件體系
+
+```text
+war/
+├── index.html                    # 遊戲介面、靜態棋盤渲染、觀戰、回放、多檔匯入與自動探索
+├── core/
+│   ├── engine.js                 # 純規則核心引擎（無 DOM、無 aiValue、瀏覽器/Node 共用）
+│   └── ai-host.js                # TFC AI Protocol v1 宿主、FogFirewall、Rules SDK、註冊表
+├── ai/                           # 100% 純熱插拔演算法目錄（單檔自包含，清空即無演算法版）
+│   ├── recruit.js
+│   ├── warrior.js
+│   ├── general.js
+│   ├── marshal.js
+│   └── wargod.js
+├── tools/
+│   ├── verify-ai.mjs             # 協議合規、Worker 隔離與迷霧零作弊審計 CLI
+│   └── arena.mjs                 # 無頭自動對戰與循環賽裁判 CLI
+├── .github/workflows/pages.yml   # GitHub Pages 部署自動產生 ai/manifest.json（不改 main）
+├── AI_PROTOCOL.md                # 自製 AI 演算法制式開發規範書（可於網頁規則頁直接下載）
+├── AGENTS.md                     # 專案開發憲法、硬性不變量與驗證清單
+├── PROGRESS.md                   # 版本里程碑、設計決策與 AI 基準測試帳本
+└── README.md                     # 本手冊
+```

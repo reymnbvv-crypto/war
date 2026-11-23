@@ -1,0 +1,50 @@
+name: Deploy Tactical Fog Chess to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build_and_deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble static site and generate ai/manifest.json (deployment artifact only)
+        run: |
+          mkdir -p _site/ai _site/core
+          cp index.html AI_PROTOCOL.md README.md _site/
+          cp core/*.js _site/core/
+          if compgen -G "ai/*.js" > /dev/null; then
+            cp ai/*.js _site/ai/
+          fi
+          node -e '
+            const fs = require("fs");
+            const files = fs.existsSync("_site/ai")
+              ? fs.readdirSync("_site/ai").filter(f => f.endsWith(".js")).sort()
+              : [];
+            fs.writeFileSync("_site/ai/manifest.json", JSON.stringify({ files }, null, 2) + "\n");
+          '
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "_site"
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
