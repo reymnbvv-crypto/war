@@ -40,6 +40,9 @@
      - GitHub Pages 採 **A1**（[`.github/workflows/pages.yml`](./.github/workflows/pages.yml) 僅在發佈產物即時生成 `ai/manifest.json`，不回寫 `main`）；
      - 網頁「匯入 AI」採 **B1**（支援一次多選與分次累加 2 支以上 `.js` 檔同台對戰，僅限當次分頁有效不寫 `localStorage`、不改寫儲存庫；同檔名熱更新覆蓋、不同檔名同 `id` 自動區隔編號）。
    - **座標系與開發手冊**：協議同時支援 `'canonical'` 與 `'world'`，推薦新演算法優先使用 `'canonical'`；規則彈窗提供單一真相源 [`AI_PROTOCOL.md`](./AI_PROTOCOL.md) 直接下載。
+7. **經使用者授權升級「將軍（`general`）」為方案 A，拉開與戰士差距並維持元帥上限（2026-11-23）**
+   - **問題診斷**：原版 `ai/general.js` 雖配置了 64K TT 陣列卻未對將軍啟用，Depth 3 寬度反較元帥更寬（`6×5`），且關閉戰術評估（`tactical = false`，漏看輕騎衝鋒線與雙重威脅）、根候選池僅 10 手（窄於戰士的 12 手）、僅 4 世界零尾部風險防護且做完 D3+Q1 即中止，導致對戰士優勢不穩（原 BO6 `3:3`，本地 32 局 `24:8`）。
+   - **方案 A 改動（僅動 [`ai/general.js`](./ai/general.js) 單檔，其餘四階 AI 維持原鎖定不動）**：啟用既有 64K TT 與最佳步排序、將寬度調為 `fast:4`／深度層 `4`（殘局 `3`）、開啟 `evaluate(..., tactical = true)`、根池擴至 `14`、世界數升至 `6`（含最後 1 個高風險伏擊世界）、風險聚合改為 `0.85 avg + 0.15 worst`、靜態延伸改為 `Q2` 並於預算充裕時對前 8 手深化至 `Depth 4 + Q2`，時間預算微調至 `750ms / 900ms`（`minTime: 400ms`）。
 
 ---
 
@@ -79,10 +82,23 @@
   - 原版 `pve` / `hotseat` / `aivai` v1 回放檔與未知自訂演算法 `id` 回放檔於 0-AI 狀態下皆成功解碼；
   - `index.html` 語法與 73 個獨立 DOM ID 完整吻合。
 
+### 5. 將軍（`general`）方案 A 升級後實力階梯驗證（2026-11-23）
+- **對戰士（`warrior`）同種子前後對照（藍紅互換，共 44 局）**：
+  - `--seed 100`（12 局，標準預算）：由原版 **9–3（75.0%）** 提升至 **11–1（91.7%）**（`avgMs 63–226ms`）。
+  - `--seed 1`（20 局，標準預算）：由原版 **15–5（75.0%）** 提升至 **19–1（95.0%）**（`avgMs 71–268ms`）。
+  - `--seed 200`（12 局，緊預算 `--budget 250` 模擬慢速裝置／`file://` 時間切片）：**11–1（91.7%）**（`avgMs 96–201ms`）。
+  - **44 局合計**：**將軍 41 勝 3 敗（93.2%）**，藍／紅雙陣營皆穩定壓制（藍 20/22、紅 21/22）。
+- **對新兵（`recruit`）4 局（`--seed 100` 藍紅互換）**：**將軍 4 勝 0 敗（100%）**（T34～T63 斬首完勝）。
+- **對元帥（`marshal`）6 局（`--seed 100` 藍紅互換）**：**將軍 2 勝 4 敗（33.3%）**（藍 3 : 紅 3，每場激戰至 T83～T120），由原本一面倒 `0–6` 提升為具對抗張力但仍明確低於元帥，完整維持 `新兵 < 戰士 ≪ 將軍 < 元帥 < 軍神` 階梯。
+- **深度與耗時採樣**：標準 `750ms` 預算下 **28/28 步達成 Depth 4 + Q2**（平均 `269ms`、最高 `484ms`，零逾時）；緊預算 `250ms` 下 **0 步停在 Depth 2**（1 步必殺瞬判、6 步 Depth 3 + Q2、7 步 Depth 4 + Q2，平均 `190ms`）。
+- **合規與安全**：`node tools/verify-ai.mjs` 全 5 支演算法通過（含 `ai/general.js` 乾淨 `vm` Worker 沙盒與藍紅雙向迷霧零作弊審計）。
+
 ---
 
 ## 四、已完成里程碑（Completed Milestones）
 
+- **2026-11-23（將軍難度方案 A 升級）**
+  - 經使用者授權僅調整單檔 [`ai/general.js`](./ai/general.js)（其餘四階 AI 維持零改動），修復 TT 停用、Depth 3 寬度過胖與戰術盲點，將對戰士勝率推升至 **93.2%（41–3）** 並維持對元帥 **2–4** 的清晰階梯。
 - **2026-11-22（演算法全面單檔化與 TFC AI Protocol v1 里程碑）**
   - 抽離純規則引擎 [`core/engine.js`](./core/engine.js)（零 `aiValue`）與協議宿主 [`core/ai-host.js`](./core/ai-host.js)（FogFirewall、Rules SDK、AiRegistry、動作合法性守門員、自動探索載入器）。
   - 將 5 階演算法完全拆分為自包含單檔 `ai/{recruit,warrior,general,marshal,wargod}.js`，且經 Golden Master 驗證 **100% bit-for-bit 一致**。
@@ -99,7 +115,7 @@
 ## 五、已知觀察與未來待辦（Known Observations & Backlog）
 
 - **已知觀察**：
-  - 原版 `general` 在 `570ms` 預算內多數停在 Depth 2（平均 `d ≈ 2.0`），正面對決自帶 2-Ply 反擊前瞻的 `warrior` 呈 `3:3` 平手（但對 `recruit` 以 `6:0` 較 `warrior` 的 `4:2` 穩定許多）；目前依鎖定原則維持原版不動。
+  - 原版 `general` 曾因 TT 未啟用、Depth 3 寬度過胖與關閉戰術評估而在 `570ms` 下與 `warrior` 纏鬥；已於 2026-11-23 經使用者授權套用方案 A 完成升級（對戰士 41–3、對元帥 2–4），目前五階難度重新回歸鎖定狀態。
   - 在頂尖長局（Turn 100+）下，紅方憑偶數 `MAX_TURNS = 120` 最後一動＋跳過守陣具有隱性殘局優勢，藍方則靠前中期主動搶高地與斬首對沖，整體 51 局達 51:49 高度均衡。
 - **未來可選 Backlog（未排程）**：
   - 基於本次架構建立「全新無演算法版本」（刪空 `ai/*.js`）交由 AI 從零開始撰寫全新演算法並透過 `tools/arena.mjs` 與現有五階 AI 打擂台。
@@ -111,6 +127,10 @@
 
 ## 六、近期對話紀錄（Session Log）
 
+- **2026-11-23｜將軍難度（`general`）方案 A 強化與難度階梯驗證**
+  - **診斷與拍板**：逐行審計 [`ai/general.js`](./ai/general.js) 對比 `warrior` 與 `marshal`，定位五大結構弱點（TT 停用、Depth 3 寬度過胖 `6×5`、根池僅 10 手、關閉 `tactical` 評估、4 世界零尾部風險防護與 Q1 即停），提出方案 A／B 供選，經使用者拍板採用**方案 A**。
+  - **程式碼與文件變更**：僅修改 [`ai/general.js`](./ai/general.js)（啟用 64K TT 與最佳步排序、寬度 `fast:4`／深度層 `4` 殘局 `3`、開啟 `tactical`、根池 `14`、6 世界含 1 高風險世界、`0.85 avg + 0.15 worst`、D3+Q2 與前 8 手 D4+Q2、`750ms/900ms` 預算），同步更新 [`README.md`](./README.md) 與 [`PROGRESS.md`](./PROGRESS.md)。
+  - **驗證結果**：`verify-ai.mjs` 全 5 支通過（Worker 沙盒＋雙向迷霧零作弊）；對戰士 44 局 **41–3（93.2%）**（含 `250ms` 緊預算 11–1）、對新兵 **4–0**、對元帥 **2–4**（維持清晰階梯）；標準預算下全程 100% 達 Depth 4 + Q2（平均 `269ms`）。
 - **2026-11-22｜核心引擎與單檔熱插拔 AI 演算法架構拆分（TFC AI Protocol v1）**
   - **設計討論與拍板**：確認目標為「後續可切出全新無演算法版本供 AI 從零撰寫，且增減任一演算法僅動 1 個檔案」。拍板廢除 `ai/shared/`、採 A1（GitHub Pages 部署產物動態生成 `manifest.json`）+ B1（網頁多檔匯入僅限當次分頁有效、同檔覆蓋、不同檔同 `id` 自動區隔）、推薦 `'canonical'` 座標系、規則頁直接提供 `AI_PROTOCOL.md` 下載、以及交付零相依 CLI 驗證與對戰工具。
   - **程式碼與文件變更**：新增 [`core/engine.js`](./core/engine.js)、[`core/ai-host.js`](./core/ai-host.js)、5 支自包含單檔 [`ai/*.js`](./ai/)、[`AI_PROTOCOL.md`](./AI_PROTOCOL.md)、[`tools/verify-ai.mjs`](./tools/verify-ai.mjs)、[`tools/arena.mjs`](./tools/arena.mjs)、[`.github/workflows/pages.yml`](./.github/workflows/pages.yml)；瘦身改寫 [`index.html`](./index.html) 並更新 [`AGENTS.md`](./AGENTS.md)、[`README.md`](./README.md)、[`PROGRESS.md`](./PROGRESS.md)。

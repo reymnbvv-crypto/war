@@ -1,7 +1,7 @@
 /* =========================================================
  * 迷霧陣線 AI 演算法：將軍 · 迷霧推演（general）
  * 完全自包含單檔，遵循 TFC AI Protocol v1。
- * 保留原版單子邊際信念、4 世界抽樣、Alpha-Beta（至 Depth 3+Q1）與時間預算。
+ * 採用單子邊際信念、6 世界抽樣（含 1 高風險世界）、64K TT、戰術評估與 Alpha-Beta（Depth 3～4 + Q2）。
  * ========================================================= */
 (function (root, factory) {
   const algo = factory();
@@ -125,7 +125,9 @@
       for (let i = 0; i < number; i++) {
         const position = Int16Array.from(knownPositions);
         const occupied = Uint8Array.from(used);
-        const worstCase = marshal && i >= number - Math.floor(number / 4);
+        const worstCase = marshal
+          ? i >= number - Math.floor(number / 4)
+          : i >= number - Math.max(1, Math.floor(number / 5));
         for (const { slot } of hidden) {
           // 抽取各棋子的邊際機率，同一假想盤面不得疊子。
           let sum = 0;
@@ -562,7 +564,7 @@
       return threat;
     }
 
-    function evaluate(board, tactical = marshal) {
+    function evaluate(board, tactical = true) {
       let score = 0;
       const late = board.turn >= maxTurns - 16;
       const key = (board.hash ^ (tactical ? 0xec820704 : 0) ^ (late ? 0xcf7a5642 : 0)) >>> 0;
@@ -651,7 +653,7 @@
       const key = (board.hash ^ turnKeys[board.turn] ^ Math.imul(extension, 0x1bcc902f)) >>> 0;
       const tableIndex = key & TABLE_MASK;
       let firstChoice = -1;
-      if (marshal && !fast && tableKeys[tableIndex] === key && tableDepth[tableIndex] >= 0) {
+      if (!fast && tableKeys[tableIndex] === key && tableDepth[tableIndex] >= 0) {
         firstChoice = tableFirst[tableIndex];
         if (tableDepth[tableIndex] >= depth) {
           const value = tableValue[tableIndex];
@@ -662,7 +664,7 @@
 
       let best = side === 1 ? -INF : INF;
       let bestMove = -1;
-      const width = fast ? 3 : (marshal ? (living <= 7 ? 3 : 4) : (depth === 1 ? 5 : 6));
+      const width = fast ? (marshal ? 3 : 4) : (living <= 7 ? 3 : 4);
       const moves = movesFor(board, side, false, width, firstChoice);
       const frame = frames[ply];
       for (const move of moves) {
@@ -681,7 +683,7 @@
         else beta = Math.min(beta, best);
         if (alpha >= beta) break;
       }
-      if (marshal && !fast) {
+      if (!fast) {
         tableKeys[tableIndex] = key;
         tableDepth[tableIndex] = depth;
         tableValue[tableIndex] = best;
@@ -691,7 +693,7 @@
       return best;
     }
 
-    const sampled = marshal ? 12 : 4;
+    const sampled = marshal ? 12 : 6;
     const worlds = sampleWorlds(sampled);
     function* rank(pool, depth, extension, fast, forceCheck = false) {
       const scored = [];
@@ -714,7 +716,7 @@
           worst = Math.min(worst, evaluated);
         }
         const average = total / sampled;
-        const score = marshal ? average * 0.7 + worst * 0.3 : average;
+        const score = marshal ? average * 0.7 + worst * 0.3 : average * 0.85 + worst * 0.15;
         scored.push({ move, score, forced: forceCheck && worst > WIN - 140 });
       }
       scored.sort((a, b) => b.score - a.score || a.move.index - b.move.index);
@@ -744,7 +746,7 @@
     emit(result());
 
     try {
-      const pool = sortedRoots.slice(0, marshal ? 24 : 10);
+      const pool = sortedRoots.slice(0, marshal ? 24 : 14);
       // 戰術搜尋逾時時留用完整比較過的上一層。
       let ranked = yield* rank(pool, 1, 0, true, true);
       best = ranked[0].move;
@@ -758,9 +760,13 @@
         best = ranked[0].move;
         completedDepth = 2;
         emit(result());
-        ranked = yield* rank(ranked.map(item => item.move), 3, 1, false);
+        ranked = yield* rank(ranked.map(item => item.move), 3, 2, false);
         best = ranked[0].move;
         completedDepth = 3;
+        emit(result());
+        ranked = yield* rank(ranked.slice(0, 8).map(item => item.move), 4, 2, false);
+        best = ranked[0].move;
+        completedDepth = 4;
         return result();
       }
 
@@ -1003,7 +1009,7 @@
       }
 
 
-      const config = { budget: 570, deadline: 700, minTime: 400 };
+      const config = { budget: 750, deadline: 900, minTime: 400 };
       const memory = createAiMemory(agentRng);
       const beliefs = INITIAL_BLUE_UNITS.map(({ x, y }) => {
         const probability = new Float32Array(CELL_COUNT);

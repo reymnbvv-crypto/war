@@ -90,7 +90,7 @@
 |---|---|---|---|---|
 | [`ai/recruit.js`](./ai/recruit.js) | `recruit` | **新兵 · 單步評估** | 單層戰術評分＋前 4 手機率抽樣 | ~0.35s |
 | [`ai/warrior.js`](./ai/warrior.js) | `warrior` | **戰士 · 預判回應** | 動態戰術姿態＋記憶殘影＋前 12 手 2-Ply 反擊前瞻 | ~0.45s |
-| [`ai/general.js`](./ai/general.js) | `general` | **將軍 · 迷霧推演** | 單子邊際信念＋4 世界抽樣＋Alpha-Beta（至 Depth 3 + Q1）＋單 Worker | ~0.6s |
+| [`ai/general.js`](./ai/general.js) | `general` | **將軍 · 迷霧推演** | 單子邊際信念＋6 世界抽樣（含 1 高風險世界）＋64K TT＋戰術評估＋Alpha-Beta（Depth 3～4 + Q2）＋單 Worker | ~0.8s |
 | [`ai/marshal.js`](./ai/marshal.js) | `marshal` | **元帥 · 深度推演** | 12 世界抽樣（含 25% 高風險世界）＋Alpha-Beta（至 Depth 5～8 + Q3～5）＋64K TT＋單 Worker | ~3s |
 | [`ai/wargod.js`](./ai/wargod.js) | `wargod` | **軍神 · 極限推演** | 192 粒子濾波（單子推進＋迷霧遭襲反推）＋2～4 Worker Pool＋PVS / Aspiration Windows / LMR / Futility / 256K TT / CVaR / VOI＋動態 1～20s 長考＋克制型殘局跳過 | **動態 1～20s**（硬上限 ~21.5s） |
 
