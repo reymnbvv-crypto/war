@@ -448,6 +448,44 @@
     }
   }
 
+  async function tryFetchGitHubPagesAiList(baseDir) {
+    try {
+      if (typeof location !== 'object' || !location.hostname) return null;
+      const host = location.hostname.toLowerCase();
+      if (!host.endsWith('.github.io')) return null;
+      const owner = host.slice(0, -'.github.io'.length);
+      if (!owner || owner.includes('.')) return null;
+
+      const pathParts = (location.pathname || '/').split('/').filter(Boolean);
+      let repo = `${owner}.github.io`;
+      let prefixParts = [];
+      if (pathParts.length > 0 && !pathParts[0].includes('.')) {
+        repo = pathParts[0];
+        prefixParts = pathParts.slice(1);
+        if (prefixParts.length > 0 && prefixParts[prefixParts.length - 1].includes('.')) {
+          prefixParts.pop();
+        }
+      }
+      const cleanBase = String(baseDir || 'ai').replace(/^\.\//, '').replace(/^\/+|\/+$/g, '');
+      const dirPath = [...prefixParts, cleanBase].filter(Boolean).join('/');
+      const apiUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${dirPath.split('/').map(encodeURIComponent).join('/')}`;
+      const res = await fetch(apiUrl, {
+        cache: 'no-store',
+        headers: { Accept: 'application/vnd.github+json' }
+      });
+      if (res.status === 404) return [];
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!Array.isArray(data)) return null;
+      return data
+        .filter(item => item && item.type === 'file' && typeof item.name === 'string' && /^[A-Za-z0-9._-]+\.js$/i.test(item.name))
+        .map(item => item.name)
+        .sort((a, b) => a.localeCompare(b));
+    } catch {
+      return null;
+    }
+  }
+
   async function discoverAndLoadBrowserAis(registry, baseDir = './ai/') {
     if (typeof location === 'object' && location.protocol === 'file:') {
       return { mode: 'file', files: [], loaded: [], errors: [] };
@@ -467,6 +505,10 @@
       else {
         files = await tryFetchDirectoryListing(baseDir);
         if (files !== null) mode = 'directory';
+        else if (host.endsWith('.github.io')) {
+          files = await tryFetchGitHubPagesAiList(baseDir);
+          if (files !== null) mode = 'github-api';
+        }
       }
     } else {
       files = await tryFetchDirectoryListing(baseDir);
