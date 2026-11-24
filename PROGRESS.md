@@ -12,6 +12,7 @@
 - **對戰模式**：人機對戰（`pve`）、雙人熱座（`hotseat`）、AI 對弈觀戰（`aivai`，開局待命、預設全圖、三視野即時切換，觀戰面板僅於本模式顯示）；完整支援 **0 演算法白板模式**（刪空 `ai/*.js` 即得純淨無演算法版本）與**網頁多檔匯入對戰**
 - **內附 AI 演算法（共 5 支獨立單檔，皆嚴格零作弊）**：`ai/recruit.js`（新兵）、`ai/warrior.js`（戰士）、`ai/general.js`（將軍）、`ai/marshal.js`（元帥）、`ai/wargod.js`（軍神）
 - **回放規格**：`.tfc-replay.json`（`format: "tactical-fog-chess-replay"`、`version: 1`，向下相容舊版 `pve` / `hotseat` / `aivai` 回放，亦相容未知自訂演算法 `id`、0-AI 環境與雙地圖模式切換播放）
+- **進行中專項規劃（臨時導航，完工即移除）**：2.5D 高清圖視覺強化更新計畫詳見 [`_tmp_hd25d_upgrade/PLAN.md`](./_tmp_hd25d_upgrade/PLAN.md)（含改版前基準圖與目標概念圖於 `_tmp_hd25d_upgrade/ref/`；此目錄為臨時計畫檔，P0～P4 全部完成並通過驗收後須整目錄清理刪除並移除本導航）
 
 ---
 
@@ -48,6 +49,10 @@
    - **零依賴獨立視覺模組**：新建 [`render/board-25d.js`](./render/board-25d.js)（純原生 Canvas 2D、HiDPI、奇幻自然地景＋純造型五兵種＋前景 HUD 層防血條截切），保留原 `#board` 100 格靜態 DOM 作為預設「**戰略圖**」，地圖正下方以單一按鈕即時切換（`切換高清圖` ↔ `切換戰略圖`，記憶於 `localStorage`），對引擎與五階 AI 零改動。
    - **精確解析命中與鏡頭操控**：棄用會受 Canvas 2D 多邊形反鋸齒邊緣污染的 Color-ID Picking，改採**逆畫家序解析點格**（零縫隙、零 GPU 回讀延遲、保留高地岩壁 1px 外緣防搶鄰格）並於 `resize()` 量測 `canvas.getBoundingClientRect()`；支援游標中心滾輪縮放（`85%～240%`）、雙指縮放、6px 防誤觸平移拖曳、4 向 90° 旋轉（工具列與 `Q`/`E`/`R`/`+`/`-`）與嚴格迷霧零洩密特效（敵軍暗箭不繪起點、迷霧移動不繪未偵測段）。
    - **UI 優化與既有 Bug 修復**：修復 `.hidden { display: none !important; }` 使「AI 對弈觀戰」面板與「藍方 AI」於非 `aivai` 模式真正隱藏（保留「AI 難度」選單於熱座原樣顯示並停用）；右側採**方案 C**（檢視與即時戰鬥預測同區切換，唯有選中己方單位並懸停可攻敵軍時顯示，零版面抖動）；雙模式皆於可攻敵子上方顯示迷霧合規「預計攻擊＆反擊」簡潔懸停小窗；高清圖大螢幕適度放寬至 `780px`、拉高戰報捲動區，並同步 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml) 複製 `render/*.js`。
+9. **2.5D 高清圖視覺強化路線與臨時計畫拍板（2026-11-23，尚未進入程式碼實作）**
+   - **允許本地 PNG 素材入庫（D1）**：經使用者明確授權，後續強化允許於儲存庫內放置預先繪製之棋子與地表／裝飾 PNG（規劃路徑 `assets/hd25d/`，屬純靜態本地檔、零外部 CDN、零建置鏈），並須保留素材缺失或 `file://` 環境時自動退回現有程序繪製的能力。
+   - **HUD 分級與畫質切換（D3 / D4）**：將棋子血條改為底座外圈環形 HP，數字與 `+N`／`★`／`夾` 徽章平時隱藏、僅於懸停／選中／縮放 ≥ 140% 或按住 `Alt` 時顯示；新增「標準／高」兩檔畫質切換（記憶於 `localStorage`，支援低效能自動降級）。
+   - **分階段路線與臨時文件管理（D2 / D5）**：規劃 P0（快取與載入基建）→ P1（俯視地表合成＋高地台地自動拼接＋連片森林）→ P2（PNG 棋子、環形 HUD、X-ray 與動作）→ P3（軟邊體積迷霧＋合併戰術區域）→ P4（光影氛圍與旋轉轉盤動畫）；完整細部規格與基準圖暫存於 [`_tmp_hd25d_upgrade/PLAN.md`](./_tmp_hd25d_upgrade/PLAN.md)，全部階段完成並驗收後依其 §11 整目錄清理刪除。
 
 ---
 
@@ -145,6 +150,8 @@
   - 原版 `general` 曾因 TT 未啟用、Depth 3 寬度過胖與關閉戰術評估而在 `570ms` 下與 `warrior` 纏鬥；已於 2026-11-23 經使用者授權套用方案 A 完成升級，經 48 局 BO8 確認穩居第二階（對戰士 `8:0`、對新兵 `8:0`、對元帥 `1:7`），目前五階難度重新回歸鎖定狀態。
   - 經 52 局實證分析，現有五階 AI 的靜態 `AI_VALUE`（弓 78 > 騎 72 > 盾 68 > 矛 66）相較真實勝負影響力**低估了重盾與長矛、高估了雙騎邊際價值**（實證：重盾 ≈ 弓手 > 長矛 > 輕騎），但在軍神深搜中因 `hp * hpWeight` 與深層交換計算，單改靜態 `AI_VALUE` 僅與舊軍神五五開（11–12）。
   - 在頂尖長局（Turn 100+）下，紅方憑偶數 `MAX_TURNS = 120` 最後一動＋跳過守陣具有隱性殘局優勢，藍方則靠前中期主動搶高地與斬首對沖；累計 99 局鏡像與循環賽達 **藍 52（52.5%）: 紅 47（47.5%）** 高度均衡。
+- **已排程專項（臨時計畫，完工即清理）**：
+  - **2.5D 高清圖視覺強化（P0～P4）**：細部設計、素材規格、基準對照圖與驗收清單見臨時檔 [`_tmp_hd25d_upgrade/PLAN.md`](./_tmp_hd25d_upgrade/PLAN.md)（目前狀態：已完成審查與規劃，待進入 P0 實作；全部完工後須刪除此臨時目錄並移除本導航）。
 - **未來可選 Backlog（未排程）**：
   - 基於本次架構建立「全新無演算法版本」（刪空 `ai/*.js`）交由 AI 從零開始撰寫全新演算法並透過 `tools/arena.mjs` 與現有五階 AI 打擂台。
   - 使用 `tools/arena.mjs --round-robin` 進行含軍神在內的 5 難度完整大循環或 Elo 天梯實測。
@@ -155,6 +162,10 @@
 
 ## 六、近期對話紀錄（Session Log）
 
+- **2026-11-23｜2.5D 高清圖現況審查、風格方向拍板與建立臨時更新計畫**
+  - **實機審查與問題診斷**：以 headless Chrome（`1440×1000`、DPR 2）截取 [`render/board-25d.js`](./render/board-25d.js) 100% 全景與 166% 藍方陣線特寫，整理三大面向瓶頸：棋子 HUD 互疊遮擋／造型扁平／缺遮擋提示與動作姿態、地圖迷霧逐格硬邊／光影偏平／疊層馬賽克／待機全圖重繪缺效能餘裕、以及高地逐格成箱與地形硬切過渡。
+  - **決策拍板（D1～D5）**：使用者確認允許在儲存庫放置預先繪製的本地 PNG 棋子與裝飾圖（`assets/hd25d/`，保留程序繪製退路）、血條改為環形 HP 且數字／徽章採懸停／選中／縮放 ≥ 140%／按住 `Alt` 分級顯示、新增「標準／高」畫質切換與效能自動降級，並按 P0～P4 全套推進。
+  - **臨時施工文件建檔**：建立臨時目錄 `_tmp_hd25d_upgrade/`（含完整施工計畫 [`_tmp_hd25d_upgrade/PLAN.md`](./_tmp_hd25d_upgrade/PLAN.md) 與 `ref/` 下改版前基準圖與風格概念圖），並於 `PROGRESS.md` 加入臨時導航；明確標註完工驗收後須整目錄清理刪除。本次僅完成審查與規劃，尚未修改正式程式碼。
 - **2026-11-23｜修復 GitHub Pages 部署偶發失敗（單 Job 產物競態）與升級 Actions 至 Node 24**
   - **問題定位**：檢查 commit `1c4f125` 觸發之失敗部署（Run `45339517471`），確認 `_site` 組裝與 `Upload Pages artifact` 均成功完成（`Artifact ID 14895307306`），但因舊版 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml) 將 `upload-pages-artifact` 與 `deploy-pages` 緊鄰置於同一 `build_and_deploy` Job 內，導致 `deploy-pages` 在產物剛 finalize 僅約 340ms 後即查詢 Artifact API 並踩中最終一致性延遲（回傳 `Found 0 artifact(s)`、`Error: No artifacts named "github-pages" were found for this workflow run`）；另發現舊版 Actions 觸發 Node.js 20 棄用警告。
   - **修復內容**：依 GitHub Pages 官方建議將 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml) 拆分為 `build` 與 `deploy`（`needs: build`）雙 Job，消除同 Job 內產物查詢競態並確保 `github-pages` 環境僅綁定於部署階段；同步升級 `actions/checkout@v7`、`actions/upload-pages-artifact@v5` 與 `actions/deploy-pages@v5` 以原生運行於 Node.js 24。
