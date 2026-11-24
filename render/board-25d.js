@@ -80,7 +80,7 @@
     ctx.closePath();
   }
 
-  function create(hostEl, callbacks = {}) {
+  function create(hostEl, callbacks = {}, options = {}) {
     const canvas = hostEl.querySelector('canvas');
     if (!canvas) throw new Error('TFCBoard25D 需要 hostEl 內的 <canvas>');
     const ctx = canvas.getContext('2d', { alpha: false });
@@ -90,12 +90,44 @@
     let height = 540;
     let dpr = 1;
     let rafId = null;
-    let dirty = true;
     let lastFrameAt = 0;
+    let idleTimer = null;
+    let lastInteraction = -Infinity;
+    let lastInteractiveFrame = null;
+    let interactionFrameCount = 0;
+    let interactionFrameTotal = 0;
+    let quality = options.quality === 'standard' ? 'standard' : 'high';
+    let showHudDetails = false;
+    let gridVisible = true;
+    let backgroundCache = null;
+    let plinthCache = null;
+    let cameraLayer = null;
+    let cameraLayerValid = false;
+    let orderedTiles = null;
+    let orderedRotation = null;
+    let assetVersion = 0;
+    let lastPointer = null;
+
+    const assets = globalThis.TFC25DAssets?.create(name => {
+      if (!name.startsWith('units/')) assetVersion++;
+      invalidateBoard();
+    });
+    const getAsset = name => assets?.get(name) || null;
+    const makeCanvas = () => canvas.ownerDocument.createElement('canvas');
+    const terrainModule = globalThis.TFC25DTerrain;
+    const terrainRenderer = terrainModule.create({
+      assets: getAsset, canvas: makeCanvas, tileHash
+    });
+    const unitArt = globalThis.TFCBoard25DUnits.create({
+      getAsset, getQuality: () => quality, isReducedMotion, getFactionPalette,
+      drawUnitSculpt, drawRoundedRectPath, facingSignFor
+    });
 
     // 鏡頭狀態（rot: 0..3，zoom: 0.85..2.4，panX/panY: CSS px）
     const camera = {
       rot: 0,
+      theta: 0,
+      rotation: null,
       zoom: 1,
       panX: 0,
       panY: 0,
@@ -126,31 +158,32 @@
       // 10×10 菱形橫跨 10*tw，縱跨 10*th + 台座厚 + 高地 + 頂部單位旗幟空間，100% 滿版舒展
       const tw = Math.min(width * 0.094, height * 0.162);
       const th = tw * 0.50;
-      const elevH = th * 0.52;
+      const elevH = th * 0.47; // 不讓高地頂面壓過後方平地的格心
       const baseDepth = th * 0.54;
       const originX = width * 0.5;
       const originY = height * 0.5 - (BOARD_SIZE - 1) * (th * 0.5) + th * 0.08;
       return { tw, th, elevH, baseDepth, originX, originY };
     }
 
+    function rotatedPoint(x, y) {
+      if (!camera.rotation) return toRotated(x, y, camera.rot);
+      const center = (BOARD_SIZE - 1) * 0.5;
+      const cos = Math.cos(camera.theta);
+      const sin = Math.sin(camera.theta);
+      return {
+        rx: center + (x - center) * cos - (y - center) * sin,
+        ry: center + (x - center) * sin + (y - center) * cos
+      };
+    }
+
     function projectBase(x, y, elev = 0, metrics = getMetrics()) {
-      const { rx, ry } = toRotated(x, y, camera.rot);
+      const { rx, ry } = rotatedPoint(x, y);
       const bx = metrics.originX + (rx - ry) * (metrics.tw * 0.5);
       const by = metrics.originY + (rx + ry) * (metrics.th * 0.5) - elev * metrics.elevH;
       return { bx, by, rx, ry };
     }
 
-    function projectFloatBase(fx, fy, felev = 0, metrics = getMetrics()) {
-      let rx, ry;
-      if (camera.rot === 0) { rx = fx; ry = fy; }
-      else if (camera.rot === 1) { rx = BOARD_SIZE - 1 - fy; ry = fx; }
-      else if (camera.rot === 2) { rx = BOARD_SIZE - 1 - fx; ry = BOARD_SIZE - 1 - fy; }
-      else { rx = fy; ry = BOARD_SIZE - 1 - fx; }
-      return {
-        bx: metrics.originX + (rx - ry) * (metrics.tw * 0.5),
-        by: metrics.originY + (rx + ry) * (metrics.th * 0.5) - felev * metrics.elevH
-      };
-    }
+    const projectFloatBase = projectBase;
 
     function baseToScreen(bx, by) {
       return {
@@ -174,10 +207,18 @@
     }
 
     function markDirty() {
-      dirty = true;
-      if (active && !rafId) {
+      if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      if (active && !canvas.ownerDocument.hidden && rafId === null) {
         rafId = requestAnimationFrame(loop);
       }
+    }
+
+    function invalidateBoard() {
+      cameraLayerValid = false;
+      markDirty();
     }
 
     function emitCameraChange(isDragging = false) {
@@ -187,7 +228,8 @@
           rot: camera.rot,
           panX: camera.panX,
           panY: camera.panY,
-          isDragging
+          isDragging,
+          isRotating: Boolean(camera.rotation)
         });
       }
     }
@@ -204,6 +246,10 @@
       width = nextW;
       height = nextH;
       dpr = nextDpr;
+      backgroundCache = null;
+      plinthCache = null;
+      cameraLayer = null;
+      cameraLayerValid = false;
       canvas.width = Math.round(width * dpr);
       canvas.height = Math.round(height * dpr);
       clampPan();
@@ -241,7 +287,9 @@
             // 2. 高地前側左右岩壁判定（保留外緣 1px 不搶走後方相鄰平地格心）
             if (elev > 0 && dx < halfW - 1) {
               const topEdgeY = cy + (1 - dx / halfW) * halfH;
-              if (by >= topEdgeY && by <= topEdgeY + elevH) {
+              const sides = terrainModule.exposedSides(map, x, y, camera.rot);
+              const exposed = bx < cx ? sides.left : sides.right;
+              if (exposed && by >= topEdgeY && by <= topEdgeY + elevH) {
                 return { x, y };
               }
             }
@@ -252,7 +300,7 @@
     }
 
     function pickTileAtClient(clientX, clientY) {
-      if (!scene || !scene.board) return null;
+      if (!scene || !scene.board || camera.rotation) return null;
       const rect = canvas.getBoundingClientRect();
       const sx = clientX - rect.left;
       const sy = clientY - rect.top;
@@ -263,6 +311,7 @@
       // 1. 優先檢查可見棋子下半主體（由最前景往後檢查），方便直接點選立體棋身
       for (let i = unitHitBoxes.length - 1; i >= 0; i--) {
         const hb = unitHitBoxes[i];
+        if (!scene.visibleUnitsByKey.has(keyOf(hb.x, hb.y))) continue;
         if (bx >= hb.left && bx <= hb.right && by >= hb.top && by <= hb.bottom) {
           return { x: hb.x, y: hb.y };
         }
@@ -383,343 +432,6 @@
       c.fillText(bottomRightAxis, rightX + tw * 0.16, rightY + plinthH * 0.65);
     }
 
-    function drawTileBase(c, x, y, cell, bx, by, metrics) {
-      const { tw, th, elevH } = metrics;
-      const halfW = tw * 0.5;
-      const halfH = th * 0.5;
-      const isEven = (x + y) % 2 === 0;
-      const h1 = tileHash(x, y, 1);
-      const h2 = tileHash(x, y, 2);
-
-      if (cell.terrain === 'hill') {
-        // 左側暖岩壁（受光面）
-        const rockL = c.createLinearGradient(bx - halfW, by, bx, by + halfH + elevH);
-        rockL.addColorStop(0, '#c9a36b');
-        rockL.addColorStop(0.45, '#9d7446');
-        rockL.addColorStop(1, '#6e4f2f');
-        c.fillStyle = rockL;
-        c.beginPath();
-        c.moveTo(bx - halfW, by);
-        c.lineTo(bx, by + halfH);
-        c.lineTo(bx, by + halfH + elevH);
-        c.lineTo(bx - halfW, by + elevH);
-        c.closePath();
-        c.fill();
-
-        // 右側暗岩壁（背光面）
-        const rockR = c.createLinearGradient(bx, by + halfH, bx + halfW, by + elevH);
-        rockR.addColorStop(0, '#7a5935');
-        rockR.addColorStop(0.5, '#563c22');
-        rockR.addColorStop(1, '#392615');
-        c.fillStyle = rockR;
-        c.beginPath();
-        c.moveTo(bx, by + halfH);
-        c.lineTo(bx + halfW, by);
-        c.lineTo(bx + halfW, by + elevH);
-        c.lineTo(bx, by + halfH + elevH);
-        c.closePath();
-        c.fill();
-
-        // 天然岩石節理與微斜岩層裂紋
-        c.strokeStyle = 'rgba(38, 22, 10, 0.34)';
-        c.lineWidth = 0.9;
-        for (const frac of [0.38, 0.72]) {
-          const j1 = (tileHash(x, y, frac * 100) - 0.5) * elevH * 0.14;
-          c.beginPath();
-          c.moveTo(bx - halfW, by + elevH * frac + j1);
-          c.lineTo(bx, by + halfH + elevH * frac);
-          c.lineTo(bx + halfW, by + elevH * frac - j1);
-          c.stroke();
-        }
-        // 垂直岩塊切面暗線
-        c.strokeStyle = 'rgba(38, 22, 10, 0.25)';
-        c.beginPath();
-        c.moveTo(bx - halfW * 0.48, by + halfH * 0.48 + elevH * 0.15);
-        c.lineTo(bx - halfW * 0.48, by + halfH * 0.48 + elevH * 0.92);
-        c.moveTo(bx + halfW * 0.45, by + halfH * 0.55 + elevH * 0.18);
-        c.lineTo(bx + halfW * 0.45, by + halfH * 0.55 + elevH * 0.88);
-        c.stroke();
-        // 中脊微光
-        c.strokeStyle = 'rgba(255, 232, 185, 0.22)';
-        c.beginPath();
-        c.moveTo(bx, by + halfH);
-        c.lineTo(bx, by + halfH + elevH);
-        c.stroke();
-
-        // 崖頂垂掛暖綠苔草緣（打破木箱感，營造自然懸崖草坡）
-        c.fillStyle = '#9aa85a';
-        c.beginPath();
-        c.moveTo(bx - halfW, by);
-        c.lineTo(bx, by + halfH);
-        c.lineTo(bx, by + halfH + elevH * 0.22);
-        c.lineTo(bx - halfW * 0.52, by + halfH * 0.52 + elevH * 0.14);
-        c.lineTo(bx - halfW, by + elevH * 0.20);
-        c.closePath();
-        c.fill();
-        c.fillStyle = '#738241';
-        c.beginPath();
-        c.moveTo(bx, by + halfH);
-        c.lineTo(bx + halfW, by);
-        c.lineTo(bx + halfW, by + elevH * 0.19);
-        c.lineTo(bx + halfW * 0.48, by + halfH * 0.52 + elevH * 0.13);
-        c.lineTo(bx, by + halfH + elevH * 0.22);
-        c.closePath();
-        c.fill();
-
-        // 高地頂面：暖陽金砂岩緣＋高地苔草台面（一眼區別於低平地草甸）
-        const topGrad = c.createLinearGradient(bx - halfW, by - halfH, bx + halfW, by + halfH);
-        topGrad.addColorStop(0, '#dfc27f');
-        topGrad.addColorStop(0.42, '#c8b06a');
-        topGrad.addColorStop(1, '#ae9654');
-        drawDiamondPath(c, bx, by, halfW, halfH);
-        c.fillStyle = topGrad;
-        c.fill();
-
-        // 頂面柔和草苔斑塊（自然有機，不生硬）
-        c.fillStyle = 'rgba(130, 166, 86, 0.34)';
-        c.beginPath();
-        c.ellipse(bx + (h1 - 0.5) * halfW * 0.22, by + (h2 - 0.5) * halfH * 0.18, halfW * 0.52, halfH * 0.44, 0, 0, Math.PI * 2);
-        c.fill();
-
-        // 高地頂緣受光高光
-        c.strokeStyle = 'rgba(255, 246, 214, 0.55)';
-        c.lineWidth = 1.15;
-        c.beginPath();
-        c.moveTo(bx - halfW + 1, by);
-        c.lineTo(bx, by - halfH + 0.8);
-        c.lineTo(bx + halfW - 1, by);
-        c.stroke();
-
-        // 小塊高地綴石與高地草芽
-        const rxOff = (h1 - 0.5) * halfW * 0.52;
-        const ryOff = (h2 - 0.5) * halfH * 0.32 - halfH * 0.12;
-        c.fillStyle = '#8b6f47';
-        c.beginPath();
-        c.ellipse(bx + rxOff, by + ryOff, tw * 0.055, th * 0.055, 0, 0, Math.PI * 2);
-        c.fill();
-        c.fillStyle = 'rgba(255, 240, 210, 0.35)';
-        c.beginPath();
-        c.ellipse(bx + rxOff - 1, by + ryOff - 1, tw * 0.025, th * 0.025, 0, 0, Math.PI * 2);
-        c.fill();
-      } else if (cell.terrain === 'forest') {
-        const fGrad = c.createLinearGradient(bx - halfW, by - halfH, bx + halfW, by + halfH);
-        fGrad.addColorStop(0, '#467448');
-        fGrad.addColorStop(0.55, '#375f3a');
-        fGrad.addColorStop(1, '#29492c');
-        drawDiamondPath(c, bx, by, halfW, halfH);
-        c.fillStyle = fGrad;
-        c.fill();
-
-        // 苔蘚林地暗斑
-        c.fillStyle = 'rgba(20, 44, 24, 0.35)';
-        c.beginPath();
-        c.ellipse(bx + (h1 - 0.5) * halfW * 0.4, by + (h2 - 0.5) * halfH * 0.35, halfW * 0.34, halfH * 0.28, 0, 0, Math.PI * 2);
-        c.fill();
-      } else {
-        // 奇幻草甸平地（雙色格紋、柔光漸層）
-        const pGrad = c.createLinearGradient(bx - halfW, by - halfH, bx + halfW, by + halfH);
-        if (isEven) {
-          pGrad.addColorStop(0, '#8db46d');
-          pGrad.addColorStop(0.55, '#7ca35e');
-          pGrad.addColorStop(1, '#6a904f');
-        } else {
-          pGrad.addColorStop(0, '#80a761');
-          pGrad.addColorStop(0.55, '#709653');
-          pGrad.addColorStop(1, '#5f8445');
-        }
-        drawDiamondPath(c, bx, by, halfW, halfH);
-        c.fillStyle = pGrad;
-        c.fill();
-
-        // 細微草葉簇與陽光小草點（完全不干擾閱讀）
-        c.strokeStyle = 'rgba(42, 74, 30, 0.28)';
-        c.lineWidth = 0.9;
-        for (let i = 0; i < 3; i++) {
-          const gx = bx + (tileHash(x, y, 10 + i) - 0.5) * halfW * 0.95;
-          const gy = by + (tileHash(x, y, 20 + i) - 0.5) * halfH * 0.85;
-          c.beginPath();
-          c.moveTo(gx, gy);
-          c.lineTo(gx - 1.5, gy - 3.2);
-          c.moveTo(gx, gy);
-          c.lineTo(gx + 1.8, gy - 2.8);
-          c.stroke();
-        }
-        if (h1 > 0.72) {
-          // 偶爾點綴微小白花／黃花
-          const fx = bx + (h2 - 0.5) * halfW * 0.65;
-          const fy = by + (tileHash(x, y, 31) - 0.5) * halfH * 0.55;
-          c.fillStyle = h1 > 0.86 ? 'rgba(254, 240, 138, 0.7)' : 'rgba(241, 245, 249, 0.62)';
-          c.beginPath();
-          c.arc(fx, fy, 1.35, 0, Math.PI * 2);
-          c.fill();
-        }
-      }
-
-      // 格線細框（讓 10×10 格界在任何縮放都清晰好讀）
-      drawDiamondPath(c, bx, by, halfW, halfH);
-      c.strokeStyle = cell.terrain === 'hill'
-        ? 'rgba(92, 54, 18, 0.48)'
-        : (cell.terrain === 'forest' ? 'rgba(18, 42, 22, 0.52)' : 'rgba(34, 58, 28, 0.32)');
-      c.lineWidth = 0.9;
-      c.stroke();
-
-      // 若鄰近左後或右後是高地，在平地／樹林邊緣投射一點柔和山崖陰影
-      if (cell.elev === 0 && scene && scene.board) {
-        const { rx, ry } = toRotated(x, y, camera.rot);
-        if (rx > 0) {
-          const backL = fromRotated(rx - 1, ry, camera.rot);
-          if (scene.board.map[backL.y][backL.x].elev > 0) {
-            c.fillStyle = 'rgba(15, 23, 42, 0.2)';
-            c.beginPath();
-            c.moveTo(bx - halfW, by);
-            c.lineTo(bx, by - halfH);
-            c.lineTo(bx + halfW * 0.25, by - halfH * 0.75);
-            c.lineTo(bx - halfW * 0.75, by + halfH * 0.25);
-            c.closePath();
-            c.fill();
-          }
-        }
-        if (ry > 0) {
-          const backR = fromRotated(rx, ry - 1, camera.rot);
-          if (scene.board.map[backR.y][backR.x].elev > 0) {
-            c.fillStyle = 'rgba(15, 23, 42, 0.16)';
-            c.beginPath();
-            c.moveTo(bx, by - halfH);
-            c.lineTo(bx + halfW, by);
-            c.lineTo(bx + halfW * 0.75, by + halfH * 0.25);
-            c.lineTo(bx - halfW * 0.25, by - halfH * 0.75);
-            c.closePath();
-            c.fill();
-          }
-        }
-      }
-    }
-
-    function drawPineTree(c, tx, ty, scale, alpha, isFogged) {
-      c.save();
-      c.globalAlpha = alpha;
-      const trunkH = 6.5 * scale;
-      const trunkW = 2.6 * scale;
-
-      // 樹底柔影
-      c.fillStyle = 'rgba(10, 24, 14, 0.36)';
-      c.beginPath();
-      c.ellipse(tx + 2.2 * scale, ty + 1.2 * scale, 7.2 * scale, 3.6 * scale, 0, 0, Math.PI * 2);
-      c.fill();
-
-      // 樹幹
-      c.fillStyle = isFogged ? '#2d2420' : '#573b26';
-      c.fillRect(tx - trunkW * 0.5, ty - trunkH, trunkW, trunkH + 1);
-
-      // 三層層疊松針樹冠（左亮右暗立體層次）
-      const tiers = [
-        { yOff: 4.5, w: 8.6, h: 10.5 },
-        { yOff: 10.5, w: 7.0, h: 9.8 },
-        { yOff: 16.0, w: 5.0, h: 8.4 }
-      ];
-      for (const tier of tiers) {
-        const baseY = ty - tier.yOff * scale;
-        const tipY = baseY - tier.h * scale;
-        const hw = tier.w * scale;
-
-        // 左半受光面
-        c.fillStyle = isFogged ? '#244034' : '#4a8b4d';
-        c.beginPath();
-        c.moveTo(tx, tipY);
-        c.lineTo(tx - hw, baseY);
-        c.lineTo(tx, baseY + 2.2 * scale);
-        c.closePath();
-        c.fill();
-
-        // 右半陰影面
-        c.fillStyle = isFogged ? '#182b25' : '#25522c';
-        c.beginPath();
-        c.moveTo(tx, tipY);
-        c.lineTo(tx, baseY + 2.2 * scale);
-        c.lineTo(tx + hw, baseY);
-        c.closePath();
-        c.fill();
-
-        // 頂脊微光
-        if (!isFogged) {
-          c.strokeStyle = 'rgba(187, 247, 208, 0.25)';
-          c.lineWidth = 0.7;
-          c.beginPath();
-          c.moveTo(tx, tipY);
-          c.lineTo(tx - hw * 0.72, baseY - 1.2 * scale);
-          c.stroke();
-        }
-      }
-      c.restore();
-    }
-
-    function drawForestCluster(c, x, y, bx, by, metrics, options) {
-      const { tw, th } = metrics;
-      const scaleBase = clamp(tw / 64, 0.62, 1.35);
-      const { occupied, softFade, isFogged, layer } = options;
-      // layer: 'back' 畫在單位後方, 'front' 畫在單位前方（若格內有單位則讓開並減淡）
-      const slots = occupied
-        ? [
-            { dx: -0.27, dy: -0.17, s: 0.86, back: true },
-            { dx: 0.26, dy: -0.16, s: 0.82, back: true },
-            { dx: -0.31, dy: 0.08, s: 0.72, back: false },
-            { dx: 0.30, dy: 0.09, s: 0.70, back: false }
-          ]
-        : [
-            { dx: -0.18, dy: -0.18, s: 0.96, back: true },
-            { dx: 0.16, dy: -0.14, s: 0.88, back: true },
-            { dx: -0.22, dy: 0.08, s: 0.86, back: false },
-            { dx: 0.14, dy: 0.12, s: 0.94, back: false }
-          ];
-
-      for (let i = 0; i < slots.length; i++) {
-        const sl = slots[i];
-        if ((layer === 'back') !== sl.back) continue;
-        const jx = (tileHash(x, y, 40 + i) - 0.5) * 0.06;
-        const jy = (tileHash(x, y, 50 + i) - 0.5) * 0.05;
-        const tx = bx + (sl.dx + jx) * tw;
-        const ty = by + (sl.dy + jy) * th;
-        const treeAlpha = layer === 'front'
-          ? (occupied ? 0.44 : (softFade ? 0.55 : 0.96))
-          : (softFade ? 0.72 : 0.98);
-        drawPineTree(c, tx, ty, scaleBase * sl.s, treeAlpha, isFogged);
-      }
-    }
-
-    /* =========================================================
-     * 戰爭迷霧與林內「隱」覆蓋層
-     * ========================================================= */
-    function drawFogOverlay(c, x, y, bx, by, metrics, nowSec) {
-      const { tw, th } = metrics;
-      const halfW = tw * 0.5;
-      const halfH = th * 0.5;
-
-      // 基底幽暗迷霧層（保留底層高地／樹林地形輪廓）
-      drawDiamondPath(c, bx, by, halfW, halfH);
-      c.fillStyle = 'rgba(11, 20, 38, 0.58)';
-      c.fill();
-
-      // 細緻霧氣紋理＋柔和緩慢飄動雲團
-      const drift = isReducedMotion() ? 0 : Math.sin(nowSec * 0.55 + x * 0.9 + y * 0.7) * (tw * 0.08);
-      const driftY = isReducedMotion() ? 0 : Math.cos(nowSec * 0.42 + x * 0.6 - y * 0.8) * (th * 0.07);
-      const puffX = bx + (tileHash(x, y, 71) - 0.5) * halfW * 0.42 + drift;
-      const puffY = by + (tileHash(x, y, 72) - 0.5) * halfH * 0.36 + driftY;
-      const puffR = tw * (0.34 + tileHash(x, y, 73) * 0.14);
-
-      c.save();
-      drawDiamondPath(c, bx, by, halfW * 1.04, halfH * 1.04);
-      c.clip();
-      const mistGrad = c.createRadialGradient(puffX, puffY, puffR * 0.08, puffX, puffY, puffR);
-      mistGrad.addColorStop(0, 'rgba(148, 178, 214, 0.24)');
-      mistGrad.addColorStop(0.55, 'rgba(71, 100, 140, 0.14)');
-      mistGrad.addColorStop(1, 'rgba(15, 23, 42, 0)');
-      c.fillStyle = mistGrad;
-      c.beginPath();
-      c.ellipse(puffX, puffY, puffR, puffR * 0.58, 0, 0, Math.PI * 2);
-      c.fill();
-      c.restore();
-    }
-
     function drawForestConcealOverlay(c, bx, by, metrics) {
       const { tw, th } = metrics;
       drawDiamondPath(c, bx, by, tw * 0.5, th * 0.5);
@@ -753,33 +465,6 @@
       const halfH = th * 0.5;
       const pulse = isReducedMotion() ? 0.5 : (0.5 + 0.5 * Math.sin(nowSec * 5.2));
 
-      // 1. 敵方可見重盾 ZoC
-      if (flags.inZoc) {
-        c.save();
-        drawDiamondPath(c, bx, by, halfW * 0.88, halfH * 0.88);
-        c.fillStyle = 'rgba(239, 68, 68, 0.12)';
-        c.fill();
-        c.strokeStyle = 'rgba(249, 115, 22, 0.92)';
-        c.lineWidth = 1.6;
-        c.setLineDash([4, 3]);
-        c.stroke();
-        c.setLineDash([]);
-
-        const zw = clamp(tw * 0.34, 18, 25);
-        const zh = clamp(th * 0.34, 11, 14);
-        const zx = bx - halfW * 0.42;
-        const zy = by + halfH * 0.28;
-        drawRoundedRectPath(c, zx - zw * 0.5, zy - zh * 0.5, zw, zh, 3);
-        c.fillStyle = 'rgba(194, 65, 12, 0.92)';
-        c.fill();
-        c.fillStyle = '#ffedd5';
-        c.font = `900 ${clamp(tw * 0.125, 7.5, 10)}px system-ui, sans-serif`;
-        c.textAlign = 'center';
-        c.textBaseline = 'middle';
-        c.fillText('ZoC', zx, zy + 0.5);
-        c.restore();
-      }
-
       // 2. 上回合 AI 可見軌跡／攻擊高亮
       if (flags.enemyAttack) {
         drawDiamondPath(c, bx, by, halfW * 0.92, halfH * 0.92);
@@ -795,40 +480,6 @@
         c.strokeStyle = `rgba(251, 146, 60, ${0.65 + pulse * 0.3})`;
         c.lineWidth = 1.8;
         c.stroke();
-      }
-
-      // 3. 可移動格 / 輕騎衝鋒金格
-      if (flags.reachable) {
-        drawDiamondPath(c, bx, by, halfW * 0.90, halfH * 0.90);
-        if (flags.charge) {
-          c.fillStyle = 'rgba(245, 158, 11, 0.38)';
-          c.fill();
-          c.strokeStyle = 'rgba(251, 191, 36, 0.98)';
-          c.lineWidth = 2.1;
-          c.stroke();
-
-          // ⚡ 衝鋒角標
-          const bSize = clamp(tw * 0.24, 13, 18);
-          const cx = bx + halfW * 0.42;
-          const cy = by - halfH * 0.34;
-          drawRoundedRectPath(c, cx - bSize * 0.5, cy - bSize * 0.5, bSize, bSize, 4);
-          c.fillStyle = '#fbbf24';
-          c.fill();
-          c.strokeStyle = '#fef3c7';
-          c.lineWidth = 1;
-          c.stroke();
-          c.fillStyle = '#451a03';
-          c.font = `900 ${clamp(tw * 0.155, 9, 12)}px system-ui, sans-serif`;
-          c.textAlign = 'center';
-          c.textBaseline = 'middle';
-          c.fillText('⚡', cx, cy + 0.5);
-        } else {
-          c.fillStyle = 'rgba(14, 165, 233, 0.33)';
-          c.fill();
-          c.strokeStyle = 'rgba(56, 189, 248, 0.94)';
-          c.lineWidth = 1.9;
-          c.stroke();
-        }
       }
 
       // 4. 伏擊閃爍
@@ -1331,211 +982,6 @@
       c.restore();
     }
 
-    function drawUnitMiniature(c, unit, bx, by, metrics, opts, nowSec, hudQueue) {
-      const { tw, th } = metrics;
-      const s = clamp(tw / 66, 0.52, 1.32);
-      const isGhost = Boolean(opts.isGhost);
-      const isSelected = Boolean(opts.isSelected);
-      const pal = getFactionPalette(unit.faction, isGhost);
-      const dir = facingSignFor(unit.faction, camera.rot);
-      const liftY = isSelected ? -3.5 * s : 0;
-      const shakeX = opts.shakeX || 0;
-      const cx = bx + shakeX;
-      const cy = by + liftY;
-
-      // 1. 選中光環或落地陰影
-      if (isSelected) {
-        const pulse = isReducedMotion() ? 0.5 : (0.5 + 0.5 * Math.sin(nowSec * 6));
-        c.save();
-        c.strokeStyle = `rgba(250, 204, 21, ${0.72 + pulse * 0.28})`;
-        c.lineWidth = 2.6 * s;
-        c.beginPath();
-        c.ellipse(cx, by + 1.5 * s, 19.2 * s, 10.0 * s, 0, 0, Math.PI * 2);
-        c.stroke();
-        c.fillStyle = 'rgba(250, 204, 21, 0.22)';
-        c.fill();
-        c.restore();
-      }
-
-      // 落地投影
-      c.fillStyle = isGhost ? 'rgba(15, 23, 42, 0.25)' : 'rgba(2, 6, 23, 0.48)';
-      c.beginPath();
-      c.ellipse(cx + 2 * s, by + 2.2 * s, 16.2 * s, 8.4 * s, 0, 0, Math.PI * 2);
-      c.fill();
-
-      // 2. 立體圓形微縮底座
-      const baseRx = 14.8 * s;
-      const baseRy = 7.6 * s;
-      const baseH = 4.5 * s;
-
-      c.save();
-      if (isGhost) c.globalAlpha = 0.72;
-
-      // 底座側邊厚度
-      c.fillStyle = pal.baseSide;
-      c.beginPath();
-      c.ellipse(cx, cy + baseH, baseRx, baseRy, 0, 0, Math.PI);
-      c.lineTo(cx - baseRx, cy);
-      c.ellipse(cx, cy, baseRx, baseRy, 0, Math.PI, 0, true);
-      c.closePath();
-      c.fill();
-
-      // 底座頂面
-      const discGrad = c.createRadialGradient(cx - 4 * s, cy - 2 * s, 2 * s, cx, cy, baseRx);
-      discGrad.addColorStop(0, pal.rim);
-      discGrad.addColorStop(0.28, pal.baseTop);
-      discGrad.addColorStop(1, pal.baseSide);
-      c.fillStyle = discGrad;
-      c.beginPath();
-      c.ellipse(cx, cy, baseRx, baseRy, 0, 0, Math.PI * 2);
-      c.fill();
-
-      // 底座金屬邊框（殘影為虛線）
-      c.strokeStyle = isSelected ? '#fde047' : pal.rim;
-      c.lineWidth = (isSelected ? 2 : 1.45) * s;
-      if (isGhost) c.setLineDash([3.5 * s, 2.5 * s]);
-      c.stroke();
-      c.setLineDash([]);
-
-      // 3. 繪製五兵種純造型微縮立雕
-      c.save();
-      c.translate(cx, cy - 1 * s);
-      drawUnitSculpt(c, unit.type, pal, s, dir, nowSec, isGhost);
-      c.restore();
-
-      // 受擊瞬間白閃
-      if (opts.hitFlash > 0) {
-        c.fillStyle = `rgba(255, 255, 255, ${opts.hitFlash * 0.65})`;
-        c.beginPath();
-        c.ellipse(cx, cy - 14 * s, 14 * s, 18 * s, 0, 0, Math.PI * 2);
-        c.fill();
-      }
-      c.restore();
-
-      // 記錄可見實兵的互動命中框（便於玩家直接點擊立體身軀）
-      if (!isGhost && opts.recordHitBox) {
-        unitHitBoxes.push({
-          x: unit.x,
-          y: unit.y,
-          left: cx - 15 * s,
-          right: cx + 15 * s,
-          top: cy - 26 * s,
-          bottom: cy + 8 * s
-        });
-      }
-
-      // 將 HUD 資訊排入前景層繪製，徹底避免被前方相鄰地塊截斷血條
-      if (hudQueue) {
-        hudQueue.push({ unit, cx, cy, s, baseRx, baseRy, pal, opts });
-      }
-    }
-
-    function drawUnitHud(c, item, metrics) {
-      const { tw, th } = metrics;
-      const { unit, cx, cy, s, baseRx, baseRy, pal, opts } = item;
-      const isGhost = Boolean(opts.isGhost);
-      const isSelected = Boolean(opts.isSelected);
-
-      if (isGhost) {
-        const label = opts.turnsAgo === 0 ? '剛目擊' : `${opts.turnsAgo}回前`;
-        const fontPx = clamp(tw * 0.125, 8, 10.5);
-        c.font = `800 ${fontPx}px system-ui, "PingFang TC", sans-serif`;
-        const lw = c.measureText(label).width + 7;
-        const lh = 12;
-        const ly = cy + baseRy * 0.85;
-        drawRoundedRectPath(c, cx - lw * 0.5, ly - lh * 0.5, lw, lh, 4);
-        c.fillStyle = 'rgba(15, 23, 42, 0.88)';
-        c.fill();
-        c.strokeStyle = pal.rim;
-        c.lineWidth = 0.9;
-        c.stroke();
-        c.fillStyle = '#e2e8f0';
-        c.textAlign = 'center';
-        c.textBaseline = 'middle';
-        c.fillText(label, cx, ly + 0.5);
-        return;
-      }
-
-      // 精簡清晰血條膠囊（貼於底座前緣，絕不被相鄰地塊遮切）
-      const hpPct = clamp(unit.hp / unit.maxHp, 0, 1);
-      const hpColor = hpPct > 0.55 ? '#4ade80' : (hpPct > 0.25 ? '#facc15' : '#f87171');
-      const pillW = clamp(tw * 0.48, 27, 39);
-      const pillH = clamp(th * 0.34, 11.5, 14);
-      const py = cy + baseRy * 0.82;
-
-      drawRoundedRectPath(c, cx - pillW * 0.5, py - pillH * 0.5, pillW, pillH, 3.5);
-      c.fillStyle = 'rgba(7, 13, 27, 0.92)';
-      c.fill();
-      c.strokeStyle = isSelected ? 'rgba(250, 204, 21, 0.95)' : 'rgba(148, 163, 184, 0.52)';
-      c.lineWidth = 0.9;
-      c.stroke();
-
-      const barX = cx - pillW * 0.5 + 2.5;
-      const barY = py - pillH * 0.5 + 2;
-      const barW = pillW - 5;
-      const barH = 2.8;
-      c.fillStyle = 'rgba(30, 41, 59, 0.95)';
-      c.fillRect(barX, barY, barW, barH);
-      c.fillStyle = hpColor;
-      c.fillRect(barX, barY, Math.max(1.5, barW * hpPct), barH);
-
-      c.fillStyle = '#f8fafc';
-      c.font = `800 ${clamp(tw * 0.118, 7.6, 9.6)}px ui-monospace, SFMono-Regular, monospace`;
-      c.textAlign = 'center';
-      c.textBaseline = 'middle';
-      c.fillText(`${unit.hp}/${unit.maxHp}`, cx, py + 2.4);
-
-      // 緊湊微徽章：★ 軍旗激勵、+1/+2 援護、夾 夾擊（貼靠底座兩側不遮臉）
-      const badgeFont = clamp(tw * 0.118, 7.5, 9.5);
-      c.font = `900 ${badgeFont}px system-ui, "PingFang TC", sans-serif`;
-      c.textAlign = 'center';
-      c.textBaseline = 'middle';
-
-      if (opts.hasAura) {
-        const ax = cx + baseRx * 0.86;
-        const ay = cy - 13 * s;
-        c.fillStyle = '#eab308';
-        c.beginPath();
-        c.arc(ax, ay, 5.2 * Math.min(1.1, s), 0, Math.PI * 2);
-        c.fill();
-        c.strokeStyle = '#fef08a';
-        c.lineWidth = 0.9;
-        c.stroke();
-        c.fillStyle = '#422006';
-        c.fillText('★', ax, ay + 0.4);
-      }
-
-      if (opts.support > 0) {
-        const sx = cx - baseRx * 0.88;
-        const sy = cy - 13 * s;
-        const sw = 13.5 * Math.min(1.1, s);
-        const sh = 10.5 * Math.min(1.1, s);
-        drawRoundedRectPath(c, sx - sw * 0.5, sy - sh * 0.5, sw, sh, 3);
-        c.fillStyle = 'rgba(15, 23, 42, 0.92)';
-        c.fill();
-        c.strokeStyle = '#38bdf8';
-        c.lineWidth = 0.9;
-        c.stroke();
-        c.fillStyle = '#38bdf8';
-        c.fillText(`+${opts.support}`, sx, sy + 0.4);
-      }
-
-      if (opts.flanked) {
-        const fx = cx + baseRx * 0.9;
-        const fy = py;
-        const fw = 12 * Math.min(1.1, s);
-        const fh = 11 * Math.min(1.1, s);
-        drawRoundedRectPath(c, fx - fw * 0.5, fy - fh * 0.5, fw, fh, 3);
-        c.fillStyle = '#991b1b';
-        c.fill();
-        c.strokeStyle = '#fca5a5';
-        c.lineWidth = 0.9;
-        c.stroke();
-        c.fillStyle = '#fef2f2';
-        c.fillText('夾', fx, fy + 0.4);
-      }
-    }
-
     /* =========================================================
      * 懸停路徑導引線與 MP 消耗氣泡
      * ========================================================= */
@@ -1560,11 +1006,11 @@
       c.lineWidth = 2.4;
       c.stroke();
 
-      // 途經點光球
-      for (let i = 1; i < pts.length; i++) {
+      // 途經點與終點箭頭
+      for (let i = 1; i < pts.length - 1; i++) {
         c.fillStyle = '#ffffff';
         c.beginPath();
-        c.arc(pts[i].bx, pts[i].by, i === pts.length - 1 ? 5.2 : 3.6, 0, Math.PI * 2);
+        c.arc(pts[i].bx, pts[i].by, 3.6, 0, Math.PI * 2);
         c.fill();
         c.strokeStyle = '#0ea5e9';
         c.lineWidth = 1.6;
@@ -1574,6 +1020,19 @@
       // 終點 MP 氣泡
       const lastCoord = hover.previewPath[hover.previewPath.length - 1];
       const lastPt = pts[pts.length - 1];
+      const previous = pts[pts.length - 2];
+      const angle = Math.atan2(lastPt.by - previous.by, lastPt.bx - previous.bx);
+      c.save();
+      c.translate(lastPt.bx, lastPt.by);
+      c.rotate(angle);
+      c.fillStyle = '#e0f2fe';
+      c.beginPath();
+      c.moveTo(2, 0);
+      c.lineTo(-10, -5);
+      c.lineTo(-10, 5);
+      c.closePath();
+      c.fill();
+      c.restore();
       const rInfo = scene.reachableMap ? scene.reachableMap.get(keyOf(lastCoord.x, lastCoord.y)) : null;
       if (rInfo) {
         const label = `${rInfo.cost}MP`;
@@ -1607,73 +1066,93 @@
       const showAll = Boolean(scene && scene.showAll);
       const viewer = scene ? scene.faction : 'blue';
 
+      const casualties = new Map();
+      const pendingHealth = new Map();
+      const reducedMotion = isReducedMotion();
       for (const fx of activeEffects) {
+        if (!showAll && fx.viewers && !fx.viewers.includes(viewer)) continue;
         const elapsed = nowMs - fx.startMs;
+        const t = elapsed / fx.durationMs;
+        const impact = reducedMotion ? 0 : (fx.impactFrac ?? 0.48);
+        const deathMs = fx.deathDurationMs || 600;
+        const afterImpact = elapsed - fx.durationMs * impact;
+        if (afterImpact < 0 && fx.targetSnapshot) {
+          if (fx.targetKilled && !reducedMotion) {
+            casualties.set(keyOf(fx.toX, fx.toY), {
+              unit: fx.targetSnapshot, opacity: 1
+            });
+          } else if (!pendingHealth.has(fx.targetId)) {
+            pendingHealth.set(fx.targetId, fx.targetSnapshot.hp);
+          }
+        }
         if (elapsed < 0) {
           next.push(fx);
           continue;
         }
-        const t = elapsed / fx.durationMs;
-        if (t >= 1) continue;
+        const stillFalling = fx.targetKilled && !reducedMotion && afterImpact < deathMs;
+        if (t >= 1 && !stillFalling) continue;
         next.push(fx);
 
         if (fx.type === 'move') {
-          if (isReducedMotion()) continue;
+          if (reducedMotion || fx.steps.length < 2) continue;
+          const steps = fx.steps;
           const ownOrAll = showAll || viewer === fx.faction;
-          const visibleSteps = ownOrAll
-            ? fx.steps
-            : fx.steps.filter(st => st.observed);
-          if (visibleSteps.length < 2) continue;
-
-          const segCount = visibleSteps.length - 1;
-          const scaled = easeInOutQuad(t) * segCount;
-          const segIdx = Math.min(segCount - 1, Math.floor(scaled));
+          const stepCount = steps.length - 1;
+          const scaled = easeInOutQuad(t) * stepCount;
+          const segIdx = Math.min(stepCount - 1, Math.floor(scaled));
           const segT = scaled - segIdx;
-          const a = visibleSteps[segIdx];
-          const b = visibleSteps[segIdx + 1];
+          const a = steps[segIdx];
+          const b = steps[segIdx + 1];
+          const seeA = a && (ownOrAll || a.observed);
+          const seeB = b && (ownOrAll || b.observed);
+          if (!seeA || !seeB) {
+            // 兩段可見路徑之間保留斷點，輪廓和衝鋒光跡都不跨過迷霧。
+            unitOverrides.set(fx.unitId, { hide: true });
+            continue;
+          }
           const elevA = scene.board.map[a.y][a.x].elev || 0;
           const elevB = scene.board.map[b.y][b.x].elev || 0;
           const hop = Math.sin(segT * Math.PI) * (elevA !== elevB ? 0.36 : 0.12);
           const pos = projectFloatBase(
-            lerp(a.x, b.x, segT),
-            lerp(a.y, b.y, segT),
-            lerp(elevA, elevB, segT) + hop,
-            metrics
+            lerp(a.x, b.x, segT), lerp(a.y, b.y, segT),
+            lerp(elevA, elevB, segT) + hop, metrics
           );
-          unitOverrides.set(fx.unitId, { bx: pos.bx, by: pos.by, shakeX: 0, hitFlash: 0 });
-          if (fx.isCharge && (ownOrAll || b.observed)) {
-            renderFx.push({ kind: 'chargeTrail', bx: pos.bx, by: pos.by, t });
-          }
+          unitOverrides.set(fx.unitId, pos);
+          if (fx.isCharge) renderFx.push({ kind: 'chargeTrail', bx: pos.bx, by: pos.by, t });
         } else if (fx.type === 'attack') {
-          if (isReducedMotion()) continue;
-          const canSeeTarget = showAll || !fx.viewers || fx.viewers.includes(viewer);
-          if (!canSeeTarget) continue;
-          // 嚴格防洩密：敵方從迷霧發動攻擊時，防守方絕不可看到起點位置或箭矢出發軌跡
-          const canSeeOrigin = showAll || viewer === fx.attackerFaction || Boolean(fx.attackerObserved);
-          const elevFrom = scene.board.map[fx.fromY][fx.fromX].elev || 0;
-          const elevTo = scene.board.map[fx.toY][fx.toX].elev || 0;
-          const pFrom = projectBase(fx.fromX, fx.fromY, elevFrom, metrics);
-          const pTo = projectBase(fx.toX, fx.toY, elevTo, metrics);
-
-          // 受擊抖動與白閃（在命中階段觸發）
-          if (t > 0.38) {
-            const ht = (t - 0.38) / 0.62;
-            const prev = unitOverrides.get(fx.targetId) || {};
-            unitOverrides.set(fx.targetId, {
-              ...prev,
-              shakeX: Math.sin(ht * Math.PI * 5) * (1 - ht) * 5,
-              hitFlash: Math.max(0, 1 - ht * 1.6)
+          const canSeeOrigin = fx.canSeeOrigin ??
+            (showAll || viewer === fx.attackerFaction || Boolean(fx.attackerObserved));
+          const pTo = projectBase(fx.toX, fx.toY, scene.board.map[fx.toY][fx.toX].elev || 0, metrics);
+          const pFrom = canSeeOrigin
+            ? projectBase(fx.fromX, fx.fromY, scene.board.map[fx.fromY][fx.fromX].elev || 0, metrics)
+            : null;
+          if (afterImpact >= 0 && stillFalling && fx.targetSnapshot) {
+            const collapse = clamp(afterImpact / deathMs, 0, 1);
+            casualties.set(keyOf(fx.toX, fx.toY), {
+              unit: fx.targetSnapshot,
+              collapse: easeOutCubic(collapse),
+              opacity: 1 - clamp((collapse - 0.38) / 0.62, 0, 1),
+              tilt: collapse * 0.9
             });
           }
-
-          renderFx.push({
-            kind: 'attack',
-            fx,
-            canSeeOrigin,
-            pFrom,
-            pTo,
-            t
-          });
+          if (!reducedMotion && canSeeOrigin && t < 1 && fx.attackerType !== 'archer') {
+            const lunge = Math.sin(Math.PI * t) * 0.15;
+            const prev = unitOverrides.get(fx.attackerId) || {};
+            unitOverrides.set(fx.attackerId, {
+              ...prev, bx: lerp(prev.bx ?? pFrom.bx, pTo.bx, lunge),
+              by: lerp(prev.by ?? pFrom.by, pTo.by, lunge)
+            });
+          }
+          if (!reducedMotion && afterImpact >= 0 && t < 1) {
+            const fade = Math.max(0, 1 - afterImpact / 190);
+            const prev = unitOverrides.get(fx.targetId) || {};
+            unitOverrides.set(fx.targetId, {
+              ...prev, tilt: fade * 0.22,
+              shakeX: Math.sin(afterImpact * 0.07) * fade * 4,
+              hitFlash: fade
+            });
+          }
+          renderFx.push({ kind: 'attack', fx, canSeeOrigin, pFrom, pTo, t, impact, afterImpact });
         } else if (fx.type === 'ambush') {
           const canSee = showAll || !fx.viewers || fx.viewers.includes(viewer);
           if (!canSee) continue;
@@ -1684,7 +1163,7 @@
       }
 
       activeEffects = next;
-      return { unitOverrides, renderFx };
+      return { unitOverrides, renderFx, casualties, pendingHealth };
     }
 
     function drawForegroundEffects(c, renderFx, metrics) {
@@ -1699,12 +1178,13 @@
           c.stroke();
           c.restore();
         } else if (item.kind === 'attack') {
-          const { fx, canSeeOrigin, pFrom, pTo, t } = item;
+          const { fx, canSeeOrigin, pFrom, pTo, t, impact, afterImpact } = item;
+          const reduced = isReducedMotion();
           c.save();
 
-          if (canSeeOrigin && fx.attackerType === 'archer' && t < 0.72) {
+          if (!reduced && canSeeOrigin && fx.attackerType === 'archer' && t < impact) {
             // 弓手高拋物線羽箭
-            const at = clamp(t / 0.62, 0, 1);
+            const at = clamp(t / impact, 0, 1);
             const arcH = Math.max(36, Math.hypot(pTo.bx - pFrom.bx, pTo.by - pFrom.by) * 0.34);
             const x1 = lerp(pFrom.bx, pTo.bx, at);
             const y1 = lerp(pFrom.by - 18, pTo.by - 14, at) - Math.sin(at * Math.PI) * arcH;
@@ -1725,9 +1205,9 @@
             c.beginPath();
             c.arc(x1, y1, 2.4, 0, Math.PI * 2);
             c.fill();
-          } else if (canSeeOrigin && fx.attackerType === 'spear' && t < 0.62) {
+          } else if (!reduced && canSeeOrigin && fx.attackerType === 'spear' && t < impact) {
             // 長矛閃亮突刺穿刺線
-            const st = easeOutCubic(clamp(t / 0.5, 0, 1));
+            const st = easeOutCubic(clamp(t / impact, 0, 1));
             const sx = lerp(pFrom.bx, pTo.bx, st);
             const sy = lerp(pFrom.by - 16, pTo.by - 14, st);
             c.strokeStyle = `rgba(224, 242, 254, ${1 - t * 1.4})`;
@@ -1737,9 +1217,9 @@
             c.moveTo(pFrom.bx, pFrom.by - 16);
             c.lineTo(sx, sy);
             c.stroke();
-          } else if (canSeeOrigin && fx.isCharge && t < 0.65) {
+          } else if (!reduced && canSeeOrigin && fx.isCharge && t < impact) {
             // 輕騎衝鋒金光軌跡
-            c.strokeStyle = `rgba(251, 191, 36, ${0.85 * (1 - t / 0.65)})`;
+            c.strokeStyle = `rgba(251, 191, 36, ${0.85 * (1 - t / impact)})`;
             c.lineWidth = 4.5;
             c.lineCap = 'round';
             c.beginPath();
@@ -1749,8 +1229,8 @@
           }
 
           // 命中斬擊／破盾爆裂（迷霧中受擊只顯示此局部爆發，絕不洩露攻方位置）
-          if (t >= 0.32) {
-            const bt = clamp((t - 0.32) / 0.68, 0, 1);
+          if (!reduced && t >= impact && t < 1) {
+            const bt = clamp((t - impact) / (1 - impact), 0, 1);
             const r = tw * (0.14 + easeOutCubic(bt) * (fx.isShattered ? 0.44 : 0.3));
             const alpha = 1 - bt;
             const ringColor = fx.isShattered
@@ -1774,6 +1254,18 @@
               c.lineTo(pTo.bx + Math.cos(ang) * r1, pTo.by - 12 + Math.sin(ang) * r1 * 0.65);
               c.stroke();
             }
+          }
+          if (fx.damageText && afterImpact >= 0) {
+            const progress = clamp((t - impact) / (1 - impact), 0, 1);
+            const y = pTo.by - 24 - (reduced ? 0 : progress * 16);
+            c.globalAlpha = progress < 0.78 ? 1 : (1 - progress) / 0.22;
+            c.font = '900 13px system-ui, sans-serif';
+            c.textAlign = 'center';
+            c.lineWidth = 3.5;
+            c.strokeStyle = '#080c18';
+            c.fillStyle = fx.damageColor || '#fca5a5';
+            c.strokeText(fx.damageText, pTo.bx, y);
+            c.fillText(fx.damageText, pTo.bx, y);
           }
           c.restore();
         } else if (item.kind === 'ambush') {
@@ -1821,12 +1313,119 @@
     /* =========================================================
      * 主繪圖幀
      * ========================================================= */
+    function drawBackground(c) {
+      const glow = c.createRadialGradient(width * 0.46, height * 0.32, 12,
+        width * 0.51, height * 0.5, Math.max(width, height) * 0.74);
+      glow.addColorStop(0, '#283b50');
+      glow.addColorStop(0.58, '#152439');
+      glow.addColorStop(1, '#09111e');
+      c.fillStyle = glow;
+      c.fillRect(0, 0, width, height);
+
+      // 遠山置於棋盤後方，輪廓的亮度低於棋格與戰術提示。
+      for (let layer = 0; layer < 2; layer++) {
+        c.beginPath();
+        c.moveTo(0, height);
+        for (let i = 0; i <= 30; i++) {
+          const peak = Math.sin(i * 0.47 + layer) * 0.044 + tileHash(i, layer, 63) * 0.047;
+          c.lineTo(width * i / 30, height * (0.42 + layer * 0.12 - peak));
+        }
+        c.lineTo(width, height);
+        c.closePath();
+        c.fillStyle = layer ? 'rgba(8, 18, 32, 0.40)' : 'rgba(12, 24, 38, 0.42)';
+        c.fill();
+      }
+      const vignette = c.createRadialGradient(width * 0.5, height * 0.47, width * 0.18,
+        width * 0.5, height * 0.47, Math.max(width, height) * 0.68);
+      vignette.addColorStop(0, 'rgba(4, 9, 18, 0)');
+      vignette.addColorStop(1, 'rgba(4, 9, 18, 0.52)');
+      c.fillStyle = vignette;
+      c.fillRect(0, 0, width, height);
+    }
+
+    function cachedCanvas(draw) {
+      const layer = makeCanvas();
+      layer.width = canvas.width;
+      layer.height = canvas.height;
+      const layerCtx = layer.getContext('2d');
+      layerCtx.scale(dpr, dpr);
+      draw(layerCtx);
+      return layer;
+    }
+
+    function drawTurningPlinth(c, metrics) {
+      const n = BOARD_SIZE - 0.5;
+      const corners = [[-0.5, -0.5], [n, -0.5], [n, n], [-0.5, n]]
+        .map(([x, y]) => projectBase(x, y, 0, metrics));
+      const h = metrics.baseDepth * 1.15;
+      c.beginPath();
+      corners.forEach((p, i) => i ? c.lineTo(p.bx, p.by + h) : c.moveTo(p.bx, p.by + h));
+      c.closePath();
+      c.fillStyle = '#080e17';
+      c.fill();
+      c.beginPath();
+      corners.forEach((p, i) => i ? c.lineTo(p.bx, p.by) : c.moveTo(p.bx, p.by));
+      c.closePath();
+      c.fillStyle = '#425334';
+      c.fill();
+      for (let i = 0; i < 4; i++) {
+        const p = corners[i];
+        const q = corners[(i + 1) % 4];
+        if (q.bx >= p.bx) continue;
+        const shade = c.createLinearGradient(0, Math.min(p.by, q.by), 0, Math.max(p.by, q.by) + h);
+        shade.addColorStop(0, '#564332');
+        shade.addColorStop(1, '#1b1715');
+        c.fillStyle = shade;
+        c.beginPath();
+        c.moveTo(p.bx, p.by);
+        c.lineTo(q.bx, q.by);
+        c.lineTo(q.bx, q.by + h);
+        c.lineTo(p.bx, p.by + h);
+        c.closePath();
+        c.fill();
+      }
+    }
+
+    function getOrderedTiles() {
+      if (!camera.rotation && orderedTiles && orderedRotation === camera.rot) return orderedTiles;
+      const tiles = [];
+      for (let y = 0; y < BOARD_SIZE; y++) {
+        for (let x = 0; x < BOARD_SIZE; x++) {
+          const { rx, ry } = rotatedPoint(x, y);
+          tiles.push({ x, y, rx, ry, key: keyOf(x, y) });
+        }
+      }
+      tiles.sort((a, b) => (a.rx + a.ry) - (b.rx + b.ry) || a.rx - b.rx);
+      if (!camera.rotation) {
+        orderedTiles = tiles;
+        orderedRotation = camera.rot;
+      }
+      return tiles;
+    }
+
+    function drawParticles(c, nowSec, metrics) {
+      if (quality !== 'high' || isReducedMotion()) return;
+      c.save();
+      for (let i = 0; i < 16; i++) {
+        const x = tileHash(i, 1, 81) * BOARD_SIZE - 0.5;
+        const y = tileHash(i, 2, 81) * BOARD_SIZE - 0.5;
+        const p = projectBase(x, y, 0, metrics);
+        const opacity = 0.24 + 0.14 * Math.sin(nowSec * 0.8 + i);
+        c.fillStyle = `rgba(255, 231, 154, ${opacity})`;
+        c.beginPath();
+        c.arc(p.bx + Math.cos(nowSec + i) * 5, p.by - 8 + Math.sin(nowSec * 0.6 + i) * 4,
+          0.75 + tileHash(i, 5, 81) * 0.8, 0, 2 * Math.PI);
+        c.fill();
+      }
+      c.restore();
+    }
+
     function drawFrame(nowMs) {
       if (!scene || !scene.board) return;
       const nowSec = nowMs * 0.001;
       const metrics = getMetrics();
+      let cameraChanged = false;
 
-      // 鏡頭平滑重置動畫
       if (camera.anim) {
         const t = clamp((nowMs - camera.anim.start) / camera.anim.dur, 0, 1);
         const e = easeOutCubic(t);
@@ -1835,148 +1434,57 @@
         camera.panY = lerp(camera.anim.fromPanY, camera.anim.toPanY, e);
         clampPan();
         if (t >= 1) camera.anim = null;
-        emitCameraChange(false);
+        cameraChanged = true;
+      }
+      if (camera.rotation) {
+        const { start, from, to } = camera.rotation;
+        const t = clamp((nowMs - start) / 250, 0, 1);
+        camera.theta = lerp(from, to, easeInOutQuad(t));
+        if (t >= 1) {
+          camera.rotation = null;
+          camera.theta = camera.rot * Math.PI * 0.5;
+          cameraChanged = true;
+        }
       }
 
       ctx.save();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-      // 背景夜空戰術微光漸層
-      const bgGrad = ctx.createRadialGradient(width * 0.42, height * 0.34, width * 0.06, width * 0.5, height * 0.52, Math.max(width, height) * 0.78);
-      bgGrad.addColorStop(0, '#13233b');
-      bgGrad.addColorStop(0.55, '#0b1426');
-      bgGrad.addColorStop(1, '#060a14');
-      ctx.fillStyle = bgGrad;
-      ctx.fillRect(0, 0, width, height);
-
-      // 鏡頭變換（以畫布中心為樞紐進行縮放與平移）
+      backgroundCache ||= cachedCanvas(drawBackground);
+      ctx.drawImage(backgroundCache, 0, 0, width, height);
       ctx.translate(width * 0.5 + camera.panX, height * 0.5 + camera.panY);
       ctx.scale(camera.zoom, camera.zoom);
       ctx.translate(-width * 0.5, -height * 0.5);
 
-      // 1. 沙盤台座與外緣座標
-      drawDioramaPlinth(ctx, metrics);
-
-      // 2. 預處理滑行／受擊動畫覆寫與單位索引
-      const { unitOverrides, renderFx } = pruneAndSampleEffects(nowMs);
-      const board = scene.board;
-      const showAll = Boolean(scene.showAll);
-      const vv = scene.vision;
-      const selUnit = scene.selUnit || null;
-      const hovered = hover.hoveredTile;
-      const hoveredRot = hovered ? toRotated(hovered.x, hovered.y, camera.rot) : null;
-      const selRot = selUnit ? toRotated(selUnit.x, selUnit.y, camera.rot) : null;
-
-      unitHitBoxes = [];
-      const unitHudQueue = [];
-
-      // 3. 畫家演算法（由遠到近逐格渲染地形、森林、迷霧、戰術疊層與微縮棋子）
-      for (let sum = 0; sum <= (BOARD_SIZE - 1) * 2; sum++) {
-        for (let rx = 0; rx < BOARD_SIZE; rx++) {
-          const ry = sum - rx;
-          if (ry < 0 || ry >= BOARD_SIZE) continue;
-          const { x, y } = fromRotated(rx, ry, camera.rot);
-          const k = keyOf(x, y);
-          const cell = board.map[y][x];
-          const elev = cell.elev || 0;
-          const { bx, by } = projectBase(x, y, elev, metrics);
-
-          const isVis = showAll || vv.tileVisible[y][x];
-          const isForestRev = showAll || vv.forestReveal[y][x];
-          const unit = scene.visibleUnitsByKey.get(k) || null;
-          const ghost = !unit && scene.ghostsByKey ? scene.ghostsByKey.get(k) : null;
-          const occupied = Boolean(unit || ghost);
-
-          // 若後方相鄰格有選中單位或滑鼠懸停，前景樹冠柔和淡出防遮擋
-          const softFadeTree = Boolean(
-            (hoveredRot && ((rx === hoveredRot.rx + 1 && ry === hoveredRot.ry) || (rx === hoveredRot.rx && ry === hoveredRot.ry + 1) || (rx === hoveredRot.rx + 1 && ry === hoveredRot.ry + 1))) ||
-            (selRot && ((rx === selRot.rx + 1 && ry === selRot.ry) || (rx === selRot.rx && ry === selRot.ry + 1)))
-          );
-
-          // 3a. 地塊與岩壁
-          drawTileBase(ctx, x, y, cell, bx, by, metrics);
-
-          // 3b. 戰爭迷霧或林內隱蔽（放於地塊上、戰術框下，讓可達格等操作清楚）
-          if (!isVis) {
-            drawFogOverlay(ctx, x, y, bx, by, metrics, nowSec);
-          }
-
-          // 3c. 戰術疊層
-          const flags = {
-            inZoc: scene.zocKeys.has(k),
-            enemyAttack: scene.enemyAttackKeys.has(k),
-            enemyTrail: scene.enemyTrailKeys.has(k),
-            reachable: scene.reachableKeys.has(k),
-            charge: scene.chargeKeys.has(k),
-            attackable: Boolean(unit && scene.attackableIds.has(unit.id)),
-            ambushFlash: Boolean(scene.ambushFlashKey === k),
-            replayMarkers: scene.markersByKey ? scene.markersByKey.get(k) : null,
-            isHovered: Boolean(hovered && hovered.x === x && hovered.y === y)
-          };
-          drawTileTacticalOverlays(ctx, x, y, bx, by, metrics, flags, nowSec);
-
-          // 3d. 後排松樹
-          if (cell.terrain === 'forest') {
-            drawForestCluster(ctx, x, y, bx, by, metrics, {
-              occupied,
-              softFade: softFadeTree || flags.isHovered,
-              isFogged: !isVis,
-              layer: 'back'
-            });
-          }
-
-          // 3e. 單位微縮模型或殘影
-          if (unit) {
-            const ov = unitOverrides.get(unit.id);
-            const drawX = ov && Number.isFinite(ov.bx) ? ov.bx : bx;
-            const drawY = ov && Number.isFinite(ov.by) ? ov.by : by;
-            const meta = scene.unitMetaById.get(unit.id) || {};
-            drawUnitMiniature(ctx, unit, drawX, drawY, metrics, {
-              isGhost: false,
-              isSelected: Boolean(selUnit && selUnit.id === unit.id),
-              hasAura: Boolean(meta.hasAura),
-              support: meta.support || 0,
-              flanked: Boolean(meta.flanked),
-              shakeX: ov ? (ov.shakeX || 0) : 0,
-              hitFlash: ov ? (ov.hitFlash || 0) : 0,
-              recordHitBox: true
-            }, nowSec, unitHudQueue);
-          } else if (ghost) {
-            drawUnitMiniature(ctx, ghost, bx, by, metrics, {
-              isGhost: true,
-              turnsAgo: Math.max(0, board.turn - ghost.turn),
-              recordHitBox: false
-            }, nowSec, unitHudQueue);
-          }
-
-          // 3f. 前排松樹與未探明樹林暗幕
-          if (cell.terrain === 'forest') {
-            drawForestCluster(ctx, x, y, bx, by, metrics, {
-              occupied,
-              softFade: softFadeTree || flags.isHovered,
-              isFogged: !isVis,
-              layer: 'front'
-            });
-            if (isVis && !isForestRev) {
-              drawForestConcealOverlay(ctx, bx, by, metrics);
-            }
-          }
+      if (camera.rotation) {
+        drawTurningPlinth(ctx, metrics);
+      } else {
+        if (plinthCache?.rot !== camera.rot) {
+          plinthCache = { rot: camera.rot, canvas: cachedCanvas(c => drawDioramaPlinth(c, metrics)) };
         }
+        ctx.drawImage(plinthCache.canvas, 0, 0, width, height);
       }
 
-      // 3.5 前景單位血條與微徽章層（完整不被前方地塊截切）
-      for (const hudItem of unitHudQueue) {
-        drawUnitHud(ctx, hudItem, metrics);
+      const movingCamera = !camera.rotation && (camera.anim || dragState?.moved ||
+        pinchState || nowMs - lastInteraction < 105);
+      const canReuse = movingCamera && !activeEffects.length && !scene.floatEffects?.length &&
+        !terrainRenderer.hasActiveAnimation?.(nowMs);
+      if (canReuse) {
+        // 鏡頭移動時重用未套平移與縮放的棋盤像素，手勢結束時重畫完整細節。
+        cameraLayer ||= makeCanvas();
+        if (!cameraLayerValid) {
+          cameraLayer.width = canvas.width;
+          cameraLayer.height = canvas.height;
+          const layerCtx = cameraLayer.getContext('2d');
+          layerCtx.scale(dpr, dpr);
+          drawBoardContents(layerCtx, nowMs, metrics, nowSec);
+          cameraLayerValid = true;
+        }
+        ctx.drawImage(cameraLayer, 0, 0, width, height);
+      } else {
+        cameraLayerValid = false;
+        drawBoardContents(ctx, nowMs, metrics, nowSec);
       }
-
-      // 4. 懸停移動路徑線（繪在地形與棋子層之上，指引清晰）
-      drawHoverMovePath(ctx, metrics);
-
-      // 5. 動態攻擊／箭矢／衝鋒／伏擊特效
-      drawForegroundEffects(ctx, renderFx, metrics);
-
-      // 6. 浮動傷害與狀態文字
-      drawFloatTexts(ctx, metrics, nowMs);
+      drawParticles(ctx, nowSec, metrics);
 
       // 7. 藍方輪到提示柔光邊框（對應經典版 blue-turn-pulse）
       if (pulseStart > 0 && !isReducedMotion()) {
@@ -1996,30 +1504,219 @@
       }
 
       ctx.restore();
+      if (cameraChanged) emitCameraChange(false);
     }
 
-    function needsContinuousAnimation() {
-      if (!active || !scene) return false;
-      if (camera.anim || activeEffects.length > 0 || pulseStart > 0) return true;
-      if (scene.floatEffects && scene.floatEffects.length > 0) return true;
-      if (isReducedMotion()) return false;
-      // 柔和飄霧、旗幟擺動、可攻脈衝與敵軍軌跡（限制為平滑節能更新）
-      return true;
+    function drawBoardContents(ctx, nowMs, metrics, nowSec) {
+      const { unitOverrides, renderFx, casualties, pendingHealth } = pruneAndSampleEffects(nowMs);
+      const board = scene.board;
+      const showAll = Boolean(scene.showAll);
+      const vv = scene.vision;
+      const selUnit = scene.selUnit || null;
+      const hovered = camera.rotation ? null : hover.hoveredTile;
+      const hoveredRot = hovered ? rotatedPoint(hovered.x, hovered.y) : null;
+      const selRot = selUnit ? rotatedPoint(selUnit.x, selUnit.y) : null;
+      const project = (x, y, elev) => projectBase(x, y, elev, metrics);
+      const frame = {
+        quality, metrics, nowMs, project, projectFloat: project, rot: camera.rot,
+        theta: camera.theta, zoom: camera.zoom, dpr, gridVisible, assetVersion,
+        reducedMotion: isReducedMotion()
+      };
+
+      unitHitBoxes = [];
+      const unitHudQueue = [];
+      const occluders = [];
+      const tiles = getOrderedTiles();
+      terrainRenderer.drawGround(ctx, scene, frame);
+
+      for (const [order, { x, y, rx, ry, key }] of tiles.entries()) {
+        const cell = board.map[y][x];
+        const { bx, by } = project(x, y, cell.elev || 0);
+        const tile = { x, y, bx, by, cell };
+        const isVis = showAll || vv.tileVisible[y][x];
+        const isForestRev = showAll || vv.forestReveal[y][x];
+        const unit = scene.visibleUnitsByKey.get(key) || null;
+        const ghost = !unit && scene.ghostsByKey?.get(key);
+        const fallen = !unit && casualties.get(key);
+        const occupied = Boolean(unit || ghost || fallen);
+        const isHovered = hovered?.x === x && hovered.y === y;
+        const inFrontOf = point => point && rx >= point.rx && ry >= point.ry &&
+          rx - point.rx <= 1 && ry - point.ry <= 1;
+        const softFade = isHovered || Boolean(inFrontOf(hoveredRot) || inFrontOf(selRot));
+        const flags = {
+          enemyAttack: scene.enemyAttackKeys.has(key),
+          enemyTrail: scene.enemyTrailKeys.has(key),
+          attackable: Boolean(unit && scene.attackableIds.has(unit.id)),
+          ambushFlash: scene.ambushFlashKey === key,
+          replayMarkers: scene.markersByKey?.get(key),
+          isHovered
+        };
+
+        if (cell.elev) {
+          terrainRenderer.drawHill(ctx, scene, frame, tile);
+          occluders.push({
+            left: bx - metrics.tw * 0.38, right: bx + metrics.tw * 0.38,
+            top: by - metrics.th * 0.35, bottom: by + metrics.th * 0.5 + metrics.elevH, order: order * 2 - 1
+          });
+        }
+        terrainRenderer.drawFog(ctx, scene, frame, tile);
+        terrainRenderer.drawTactics(ctx, scene, frame, tile);
+        drawTileTacticalOverlays(ctx, x, y, bx, by, metrics, flags, nowSec);
+
+        const forest = layer => terrainRenderer.drawForest(ctx, scene, frame, tile, {
+          occupied, softFade, isFogged: !isVis, layer
+        });
+        if (cell.terrain === 'forest') forest('back');
+
+        if (unit || ghost || fallen) {
+          const moving = (unit || fallen) && unitOverrides.get((unit || fallen.unit).id);
+          const ov = fallen ? { ...moving, ...fallen } : moving;
+          if (!ov?.hide) {
+            const raw = unit || fallen?.unit || ghost;
+            const hp = pendingHealth.get(raw.id);
+            const piece = unit && hp !== undefined ? { ...raw, hp } : raw;
+            const meta = unit && scene.unitMetaById.get(unit.id);
+            const opts = {
+              ...meta, ...ov, isGhost: piece === ghost, isCasualty: Boolean(fallen),
+              turnsAgo: piece === ghost ? Math.max(0, board.turn - ghost.turn) : 0,
+              isSelected: Boolean(unit && selUnit?.id === unit.id),
+              recordHitBox: Boolean(unit), order: order * 2,
+              rot: camera.rot, zoom: camera.zoom, dpr
+            };
+            unitArt.drawMiniature(ctx, piece, ov?.bx ?? bx, ov?.by ?? by,
+              metrics, opts, nowSec, unitHudQueue, unitHitBoxes);
+          }
+        }
+        if (cell.terrain === 'forest') {
+          forest('front');
+          if (!softFade) {
+            occluders.push({
+              left: bx - metrics.tw * 0.27, right: bx + metrics.tw * 0.27,
+              top: by - metrics.tw * 0.46, bottom: by + metrics.th * 0.35, order: order * 2 + 1
+            });
+          }
+          if (isVis && !isForestRev) drawForestConcealOverlay(ctx, bx, by, metrics);
+        }
+        terrainRenderer.drawUpperFog(ctx, scene, frame, tile);
+      }
+
+      unitArt.drawXray(ctx, unitHudQueue, occluders);
+      const topLeft = screenToBase(0, 0);
+      const bottomRight = screenToBase(width, height);
+      unitArt.drawHud(ctx, unitHudQueue, metrics, {
+        zoom: camera.zoom, hoveredTile: hovered, showDetails: showHudDetails,
+        viewBounds: { left: topLeft.bx, right: bottomRight.bx, top: topLeft.by, bottom: bottomRight.by }
+      });
+
+      // 4. 懸停移動路徑線（繪在地形與棋子層之上，指引清晰）
+      if (!camera.rotation) drawHoverMovePath(ctx, metrics);
+
+      // 5. 動態攻擊／箭矢／衝鋒／伏擊特效
+      drawForegroundEffects(ctx, renderFx, metrics);
+
+      // 6. 浮動傷害與狀態文字
+      drawFloatTexts(ctx, metrics, nowMs);
+
+    }
+
+    function resetInteractiveSamples() {
+      lastInteractiveFrame = null;
+      interactionFrameCount = 0;
+      interactionFrameTotal = 0;
+    }
+
+    function trackInteractiveFrame(nowMs, interactive) {
+      if (quality !== 'high' || !interactive) {
+        // 待機期間停止取樣，以免把刻意限幀的等待時間算進去。
+        lastInteractiveFrame = null;
+        return;
+      }
+      if (lastInteractiveFrame !== null) {
+        const elapsed = nowMs - lastInteractiveFrame;
+        if (elapsed > 250) {
+          resetInteractiveSamples();
+        } else {
+          interactionFrameCount++;
+          interactionFrameTotal += elapsed;
+        }
+      }
+      lastInteractiveFrame = nowMs;
+      if (interactionFrameCount < 90) return;
+      if (interactionFrameTotal / interactionFrameCount > 28) setQuality('standard', true);
+      resetInteractiveSamples();
+    }
+
+    function setQuality(next, automaticallyLowered = false) {
+      const resolved = next === 'high' ? 'high' : 'standard';
+      if (resolved === quality) return;
+      quality = resolved;
+      resetInteractiveSamples();
+      unitArt.clearCache();
+      callbacks.onQualityChange?.({ quality, automaticallyLowered });
+      invalidateBoard();
+    }
+
+    function stopFrames() {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      rafId = null;
+      idleTimer = null;
     }
 
     function loop(nowMs) {
       rafId = null;
-      if (!active) return;
-      const highRate = Boolean(camera.anim || activeEffects.length > 0 || pulseStart > 0 || dragState?.moved || pinchState || (scene && scene.floatEffects && scene.floatEffects.length > 0));
-      const minInterval = highRate ? 0 : 42; // 靜態待機下以 ~24fps 柔和飄霧省電，互動／動畫全速 60fps
-      if (dirty || (nowMs - lastFrameAt >= minInterval)) {
-        dirty = false;
-        lastFrameAt = nowMs;
-        drawFrame(nowMs);
+      if (!active || !scene || canvas.ownerDocument.hidden) return;
+      const interactive = Boolean(camera.anim || camera.rotation || dragState?.moved ||
+        pinchState || nowMs - lastInteraction < 105);
+      const finishingRotation = Boolean(camera.rotation);
+      trackInteractiveFrame(nowMs, interactive);
+      lastFrameAt = nowMs;
+      drawFrame(nowMs);
+      if (finishingRotation && !camera.rotation && lastPointer) {
+        const hit = pickTileAtClient(lastPointer.x, lastPointer.y);
+        if (hit) callbacks.onTileHover?.(hit.x, hit.y);
       }
-      if (needsContinuousAnimation()) {
+
+      if (rafId !== null) return;
+      if (interactive || activeEffects.length || pulseStart ||
+          terrainRenderer.hasActiveAnimation?.(nowMs)) {
         rafId = requestAnimationFrame(loop);
+        return;
       }
+      const hasText = scene.floatEffects?.some(fx => nowMs - fx.createdAt < 1500);
+      const ambient = !isReducedMotion() &&
+        (quality === 'high' || Array.from(scene.visibleUnitsByKey.values()).some(unit => unit.type === 'flag'));
+      if (ambient || hasText) {
+        const interval = 1000 / (quality === 'high' ? 24 : 12);
+        idleTimer = setTimeout(() => {
+          idleTimer = null;
+          if (active && !canvas.ownerDocument.hidden && rafId === null) {
+            rafId = requestAnimationFrame(loop);
+          }
+        }, Math.max(0, interval - (performance.now() - lastFrameAt)));
+      }
+    }
+
+    function onVisibilityChange() {
+      resetInteractiveSamples();
+      if (canvas.ownerDocument.hidden) stopFrames();
+      else markDirty();
+    }
+
+    function onMotionPreferenceChange() {
+      if (isReducedMotion()) {
+        camera.rotation = null;
+        camera.theta = camera.rot * Math.PI * 0.5;
+        if (camera.anim) {
+          camera.zoom = camera.anim.toZoom;
+          camera.panX = camera.anim.toPanX;
+          camera.panY = camera.anim.toPanY;
+          camera.anim = null;
+        }
+        pulseStart = 0;
+        emitCameraChange(false);
+      }
+      markDirty();
     }
 
     /* =========================================================
@@ -2028,6 +1725,8 @@
     function handleWheel(e) {
       if (!active) return;
       e.preventDefault();
+      if (camera.rotation) return;
+      lastInteraction = performance.now();
       camera.anim = null;
       const rect = canvas.getBoundingClientRect();
       const sx = e.clientX - rect.left;
@@ -2043,7 +1742,7 @@
     }
 
     function handlePointerDown(e) {
-      if (!active) return;
+      if (!active || camera.rotation) return;
       if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 1 && e.button !== 2) return;
       canvas.setPointerCapture?.(e.pointerId);
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
@@ -2084,6 +1783,8 @@
 
     function handlePointerMove(e) {
       if (!active) return;
+      if (e.pointerType !== 'touch') lastPointer = { x: e.clientX, y: e.clientY };
+      if (camera.rotation) return;
       if (pointers.has(e.pointerId)) {
         pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
       }
@@ -2154,6 +1855,7 @@
     }
 
     function handlePointerLeave() {
+      lastPointer = null;
       if (!active) return;
       if (!dragState) {
         canvas.style.cursor = 'grab';
@@ -2166,6 +1868,8 @@
       if (active) e.preventDefault();
     }
 
+    canvas.ownerDocument.addEventListener('visibilitychange', onVisibilityChange);
+    reducedMotionQuery?.addEventListener('change', onMotionPreferenceChange);
     canvas.addEventListener('wheel', handleWheel, { passive: false });
     canvas.addEventListener('pointerdown', handlePointerDown);
     canvas.addEventListener('pointermove', handlePointerMove);
@@ -2192,13 +1896,20 @@
         active = flag;
         if (active) {
           resize();
+          assets?.load();
           markDirty();
           emitCameraChange(false);
         } else {
-          if (rafId) {
-            cancelAnimationFrame(rafId);
-            rafId = null;
-          }
+          stopFrames();
+          resetInteractiveSamples();
+          activeEffects = [];
+          pulseStart = 0;
+          unitHitBoxes = [];
+          cameraLayer = null;
+          cameraLayerValid = false;
+          lastPointer = null;
+          camera.rotation = null;
+          camera.theta = camera.rot * Math.PI * 0.5;
           pointers.clear();
           dragState = null;
           pinchState = null;
@@ -2207,13 +1918,30 @@
       },
 
       setScene(nextScene) {
+        if (scene?.viewKey !== nextScene.viewKey || scene?.board.map !== nextScene.board.map) {
+          activeEffects = [];
+          pulseStart = 0;
+          unitHitBoxes = [];
+        }
         scene = nextScene;
-        markDirty();
+        invalidateBoard();
+      },
+
+      setQuality,
+
+      setGridVisible(value) {
+        gridVisible = Boolean(value);
+        invalidateBoard();
+      },
+
+      setHudDetails(value) {
+        showHudDetails = Boolean(value);
+        invalidateBoard();
       },
 
       setHover(nextHover) {
         hover = nextHover || { hoveredTile: null, previewPath: [] };
-        markDirty();
+        invalidateBoard();
       },
 
       pushEffect(fx) {
@@ -2230,16 +1958,26 @@
       clearEffects() {
         activeEffects = [];
         pulseStart = 0;
-        markDirty();
+        invalidateBoard();
       },
 
       triggerBlueTurnPulse() {
+        if (isReducedMotion()) return;
         pulseStart = typeof performance === 'object' ? performance.now() : Date.now();
         markDirty();
       },
 
       rotate(delta) {
-        camera.rot = (camera.rot + (delta >= 0 ? 1 : 3)) % 4;
+        if (camera.rotation || dragState || pinchState) return;
+        const step = delta >= 0 ? 1 : -1;
+        if (!isReducedMotion()) {
+          camera.rotation = { start: performance.now(), from: camera.theta,
+            to: camera.theta + step * Math.PI * 0.5 };
+        }
+        camera.rot = (camera.rot + step + 4) % 4;
+        if (!camera.rotation) camera.theta = camera.rot * Math.PI * 0.5;
+        unitHitBoxes = [];
+        lastInteraction = performance.now();
         markDirty();
         emitCameraChange(false);
       },
@@ -2270,6 +2008,9 @@
 
       resetCamera() {
         camera.rot = 0;
+        camera.theta = 0;
+        camera.rotation = null;
+        unitHitBoxes = [];
         const nowMs = typeof performance === 'object' ? performance.now() : Date.now();
         if (isReducedMotion()) {
           camera.zoom = 1;
@@ -2298,7 +2039,7 @@
 
       // 回傳該格單位上方在 hostEl 內的螢幕定位點，供戰鬥預測浮動小窗精準對齊
       getTileScreenPoint(x, y) {
-        if (!scene || !scene.board) return null;
+        if (!scene || !scene.board || camera.rotation) return null;
         const metrics = getMetrics();
         const elev = scene.board.map[y][x].elev || 0;
         const base = projectBase(x, y, elev, metrics);
@@ -2307,7 +2048,7 @@
         return {
           x: pt.sx,
           y: pt.sy,
-          topY: pt.sy - unitLift,
+          topY: pt.sy - unitLift - 16,
           bottomY: pt.sy + metrics.th * 0.52 * camera.zoom,
           width,
           height
@@ -2319,6 +2060,8 @@
       destroy() {
         this.setActive(false);
         resizeObserver?.disconnect();
+        canvas.ownerDocument.removeEventListener('visibilitychange', onVisibilityChange);
+        reducedMotionQuery?.removeEventListener('change', onMotionPreferenceChange);
         canvas.removeEventListener('wheel', handleWheel);
         canvas.removeEventListener('pointerdown', handlePointerDown);
         canvas.removeEventListener('pointermove', handlePointerMove);

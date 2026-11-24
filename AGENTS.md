@@ -51,7 +51,9 @@
   - 規則彈窗（`#rulesModal`）提供單一真相源 [`AI_PROTOCOL.md`](./AI_PROTOCOL.md) 下載按鈕與本機匯入入口。
 - **雙地圖模式切換（戰略圖 ↔ 2.5D 高清圖）**：
   - 地圖正下方以單一按鈕切換（`切換高清圖` ↔ `切換戰略圖`），初次預設為**戰略圖**（記憶於 `localStorage`）；可於人機／熱座／AI 對弈／回放中即時無縫切換。
-  - 2.5D 高清圖（[`render/board-25d.js`](./render/board-25d.js)）為純原生 Canvas 2D 奇幻自然地景微縮沙盤與純造型兵種，支援游標中心縮放、6px 防誤觸平移、4 向 90° 旋轉、逆畫家序解析點格（`resize()` 須量測 `canvas.getBoundingClientRect()` 避免外框邊界偏移）與嚴格迷霧零洩密動畫。
+  - 2.5D 高清圖（[`render/board-25d.js`](./render/board-25d.js)）為 Canvas 2D 微縮沙盤，使用本地 PNG（`assets/hd25d/`）。素材缺失或 `file://` 下使用程序繪圖。繪製過 PNG 的畫布避免像素回讀，迷霧遮罩使用獨立程序畫布。
+  - 採游標中心縮放、6px 滑鼠／8px 觸控防誤觸平移、4 向 90° 平滑旋轉與逆畫家序解析點格。`resize()` 量測畫布本身，高地繪圖與點格共用外露崖面，旋轉動畫期間暫停點格。
+  - Canvas 場景僅接收公開地形與視角授權資料。切換視角或跳轉回放時重置特效與迷霧轉場，移動特效在未偵測路徑處中斷。
 - **戰鬥預測（方案 C）、硬性定高檢視卡與零抖動排版**：
   - 右側「單位與地形檢視」與「即時戰鬥預測拆解」採同區切換（`#inspectorCard` 桌面固定硬性高度 `324px`、內部自適應捲動安全網），唯有選中己方單位並懸停於可攻擊敵軍上方時才切換顯示預測，同時於該敵子上方浮現簡潔攻防／反擊小窗（雙模式共用、嚴格呼叫 `createObservedBoard` 遵守迷霧）。
   - 全域 `html { scrollbar-gutter: stable; }` 搭配選項 A 戰報區高度平衡（`pve`/`hotseat` `11.25rem`、`aivai`/`replaying` `7.5rem`）及 `#statusBanner`/`#actionSubHint` 固定最小高度，確保懸停、切換模式或展開速查時零左右／上下抖動。
@@ -64,7 +66,8 @@
 
 - **[`core/engine.js`](./core/engine.js)**：純規則引擎（常數、地形、`hasLineOfSight`、`computeVisionData`、`isInEnemyShieldZoc`、`computeReachableFor`、`previewCombat`、`evaluateVictory`、`evaluateTurnLimitVictory`、`generateLegalActions`、`validateAction`）。
 - **[`core/ai-host.js`](./core/ai-host.js)**：TFC AI Protocol v1 宿主（180° 鏡像適配層、`createRulesSdk`、`validateManifest`、`createRegistry`、`evaluateAiSource`、`discoverAndLoadBrowserAis`、`createMatchHost`）。
-- **[`render/board-25d.js`](./render/board-25d.js)**：2.5D 高清奇幻微縮沙盤渲染器（純 Canvas 2D、4 向旋轉、縮放／平移、逆畫家序精確點格、純造型五兵種、迷霧零洩密特效）。
+- **[`render/board-25d.js`](./render/board-25d.js)**：2.5D 高清奇幻微縮沙盤渲染器（鏡頭、投影、解析點格、幀排程與戰鬥特效）。同目錄模組負責素材載入、地形／迷霧／戰術區域，以及棋子與 HUD。
+- **[`assets/hd25d/`](./assets/hd25d/)**：僅存放正式的本地棋子、地形與裝飾 PNG。
 - **[`ai/`](./ai/)**（純熱插拔演算法槽，單檔自包含）：
   - `recruit.js`、`warrior.js`、`general.js`、`marshal.js`、`wargod.js`（清空即為無演算法版本）。
 - **[`index.html`](./index.html)**：靜態樣式、頂部控制列、戰略圖 DOM／2.5D 渲染橋接／觀戰／回放／方案 C 檢視預測／戰報渲染、人類操作、多檔匯入 AI、`AI_PROTOCOL.md` 下載與 `bootstrapGame` 自動探索啟動。
@@ -72,7 +75,7 @@
   - [`tools/verify-ai.mjs`](./tools/verify-ai.mjs)：單檔或全目錄協議合規、合法步、Worker 沙盒隔離、迷霧零作弊審計與中止健檢。
   - [`tools/arena.mjs`](./tools/arena.mjs)：無頭自動對戰與全循環賽裁判。
 - **[`AI_PROTOCOL.md`](./AI_PROTOCOL.md)**：純規則＋TFC AI Protocol v1 完整開發手冊與無策略空殼範本。
-- **[`.github/workflows/pages.yml`](./.github/workflows/pages.yml)**：GitHub Pages 部署組裝靜態產物（含 `render/`）並自動產生 `ai/manifest.json` 流程。
+- **[`.github/workflows/pages.yml`](./.github/workflows/pages.yml)**：GitHub Pages 部署組裝靜態產物（含 `render/` 與 `assets/`）並自動產生 `ai/manifest.json` 流程。
 
 ---
 

@@ -29,6 +29,10 @@ jobs:
           if compgen -G "render/*.js" > /dev/null; then
             cp render/*.js _site/render/
           fi
+          if [ -d assets/hd25d ]; then
+            mkdir -p _site/assets
+            cp -R assets/hd25d _site/assets/
+          fi
           if compgen -G "ai/*.js" > /dev/null; then
             cp ai/*.js _site/ai/
           fi

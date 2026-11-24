@@ -1032,6 +1032,13 @@
       color: #ffffff;
     }
 
+    .hd-cam-btn.hd-quality-btn {
+      width: auto;
+      padding: 0 6px;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
     .hd-zoom-badge {
       padding: 0 5px;
       font-size: 10px;
@@ -1094,6 +1101,28 @@
       font-size: 10.5px;
       color: #93c5fd;
       font-weight: 600;
+    }
+
+    .hd-display-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.35rem;
+    }
+
+    .hd-display-controls button {
+      min-height: 30px;
+      white-space: nowrap;
+    }
+
+    .hd-display-controls button[aria-pressed="true"] {
+      border-color: #60a5fa;
+      background: #1e3a5f;
+      color: #e0f2fe;
+    }
+
+    @media (pointer: coarse) {
+      .hd-display-controls button { min-height: 40px; }
     }
 
     /* 可攻擊棋子上方簡潔戰鬥／反擊懸停小窗（雙模式共用、嚴格遵守迷霧） */
@@ -1359,6 +1388,7 @@
             <button id="btnHdRotLeft" type="button" class="hd-cam-btn" title="逆時針旋轉 90°（Q）" aria-label="左轉 90 度">↺</button>
             <button id="btnHdRotRight" type="button" class="hd-cam-btn" title="順時針旋轉 90°（E）" aria-label="右轉 90 度">↻</button>
             <button id="btnHdResetCam" type="button" class="hd-cam-btn" title="重置視角與縮放（R）" aria-label="重置視角">⟲</button>
+            <button id="hdQualityBtn" type="button" class="hd-cam-btn hd-quality-btn" title="切換高清圖畫質">畫質：標準</button>
           </div>
         </div>
 
@@ -1372,9 +1402,11 @@
           <button id="btnToggleMapMode" type="button" class="map-toggle-btn" title="在戰略圖（經典平面）與高清圖（2.5D 微縮戰場）間即時切換">
             切換高清圖
           </button>
-          <span id="hdControlHint" class="hd-control-hint hidden">
-            滾輪縮放 · 拖曳移動 · Q/E 旋轉 · R 重置
-          </span>
+          <div id="hdDisplayControls" class="hd-display-controls hidden">
+            <button id="hdDetailsBtn" type="button" class="control-button" aria-pressed="false" title="按住 Alt 可暫時顯示數值">顯示數值</button>
+            <button id="hdGridBtn" type="button" class="control-button" aria-pressed="true">格線</button>
+            <span id="hdControlHint" class="hd-control-hint" role="status"></span>
+          </div>
           <div class="flex flex-wrap items-center gap-2 text-slate-400">
             <span><strong class="text-yellow-400">★</strong>軍旗</span>
             <span><strong class="text-sky-400">+1/+2</strong>援護</span>
@@ -1632,6 +1664,9 @@
 
 <script src="core/engine.js"></script>
 <script src="core/ai-host.js"></script>
+<script src="render/board-25d-assets.js"></script>
+<script src="render/board-25d-terrain.js"></script>
+<script src="render/board-25d-units.js"></script>
 <script src="render/board-25d.js"></script>
 <script>
 (() => {
@@ -1644,7 +1679,9 @@
    * ========================================================= */
   const Engine = window.TFCEngine;
   const AiHost = window.TFC_AI;
-  const Board25DModule = window.TFCBoard25D || null;
+  const Board25DModule = window.TFC25DTerrain && window.TFCBoard25DUnits
+    ? window.TFCBoard25D
+    : null;
   if (!Engine || !AiHost) {
     throw new Error('缺少核心模組 core/engine.js 或 core/ai-host.js');
   }
@@ -1675,6 +1712,8 @@
    * 二、全域狀態、動態演算法註冊與靜態 DOM 管理
    * ========================================================= */
   const MAP_MODE_STORAGE_KEY = 'tfc_map_mode_v1';
+  const HD_QUALITY_STORAGE_KEY = 'tfc_hd_quality_v1';
+  const hdReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
   let currentMode = 'hotseat';
   let currentDifficulty = null;
   let blueAiDifficulty = null;
@@ -1706,6 +1745,16 @@
   let mapMode = 'classic'; // 'classic'（戰略圖，初次預設）| 'hd25d'（2.5D 高清圖）
   let board25d = null;
   let hdDragging = false;
+  let hdRotating = false;
+  let hdQuality = loadSavedHdQuality();
+  let hdQualityNotice = false;
+  let hdQualityNoticeShown = false;
+  let hdAltHeld = false;
+  let hdDetailsPinned = false;
+  let hdGridVisible = true;
+  let hdViewKey = null;
+  let hdViewEpoch = 0;
+  let hdMovement = null;
   let activeCombatHoverTarget = null;
 
   const isHdMap = () => mapMode === 'hd25d' && Boolean(board25d);
@@ -1728,10 +1777,87 @@
     }
   }
 
+  function loadSavedHdQuality() {
+    try {
+      const saved = window.localStorage.getItem(HD_QUALITY_STORAGE_KEY);
+      if (saved === 'standard' || saved === 'high') return saved;
+    } catch {
+      // 受限的儲存環境仍可依裝置選擇畫質。
+    }
+    return window.matchMedia('(pointer: coarse)').matches || navigator.deviceMemory <= 4 ? 'standard' : 'high';
+  }
+
+  function updateHdQuality({ quality, automaticallyLowered = false }) {
+    hdQuality = quality;
+    if (automaticallyLowered && !hdQualityNoticeShown) {
+      hdQualityNotice = true;
+      hdQualityNoticeShown = true;
+    }
+    document.getElementById('hdQualityBtn').textContent = quality === 'high' ? '畫質：高' : '畫質：標準';
+    const interactionHint = window.matchMedia('(pointer: coarse)').matches ? '雙指縮放 · 單指平移' : '滾輪縮放 · 拖曳平移';
+    document.getElementById('hdControlHint').textContent = hdQualityNotice ? '已自動降為標準畫質' : interactionHint;
+  }
+
+  function updateHdDetails() {
+    const showDetails = hdDetailsPinned || hdAltHeld;
+    document.getElementById('hdDetailsBtn').setAttribute('aria-pressed', String(showDetails));
+    board25d?.setHudDetails(showDetails);
+  }
+
+  function releaseHdAlt() {
+    if (!hdAltHeld) return;
+    hdAltHeld = false;
+    updateHdDetails();
+  }
+
+  function resetHdView() {
+    hdViewKey = null;
+    hdViewEpoch++;
+    hdMovement = null;
+    discardBoardHover();
+    releaseHdAlt();
+    board25d?.clearEffects();
+  }
+
+  function hdEffectSpeed() {
+    return isAiVsAi() && aiMatchSpeed < 1 ? 0.5 : 1;
+  }
+
   function emitBoard25dEffect(fx) {
-    if (board25d && mapMode === 'hd25d' && !replay) {
+    if (!isHdMap() || replay) return;
+    const { faction: viewer, showAll } = getBoardView();
+    if (!showAll && !fx.viewers.includes(viewer)) return;
+    if (fx.type === 'attack' && !fx.canSeeOrigin) {
+      const { attackerId, attackerType, fromX, fromY, ...impact } = fx;
+      board25d.pushEffect({ ...impact, isCharge: false });
+    } else {
       board25d.pushEffect(fx);
     }
+  }
+
+  function emitBoard25dMovement(unit, movement) {
+    if (!isHdMap() || replay || hdReducedMotion.matches || movement.steps.length < 2) return;
+    const { faction: viewer, showAll } = getBoardView();
+    const steps = [];
+    let hiddenGap = false;
+    let visibleCount = 0;
+    for (const { x, y, observed } of movement.steps) {
+      if (!showAll && viewer !== unit.faction && !observed) {
+        hiddenGap = true;
+        continue;
+      }
+      if (hiddenGap && steps.length) steps.push(null);
+      hiddenGap = false;
+      visibleCount++;
+      steps.push({ x, y, observed: true });
+    }
+    if (visibleCount < 2) return;
+    const durationMs = Math.round(Math.min(460, 150 + (visibleCount - 1) * 85) * hdEffectSpeed());
+    hdMovement = { unitId: unit.id, endMs: performance.now() + durationMs };
+    board25d.pushEffect({
+      type: 'move', unitId: unit.id, faction: unit.faction, steps, durationMs,
+      isCharge: visibleCount === movement.steps.length && isChargeActive(unit, movement.displacement, state)
+    });
   }
 
   function updateHdZoomBadge(zoom = 1) {
@@ -1741,6 +1867,7 @@
 
   function setMapMode(nextMode, options = {}) {
     const resolved = (nextMode === 'hd25d' && board25d) ? 'hd25d' : 'classic';
+    if (resolved !== mapMode) resetHdView();
     mapMode = resolved;
     if (!options.skipSave) saveMapMode(resolved);
 
@@ -1749,7 +1876,7 @@
     const boardEl = document.getElementById('board');
     const hdHost = document.getElementById('board25dHost');
     const btnToggle = document.getElementById('btnToggleMapMode');
-    const hdHint = document.getElementById('hdControlHint');
+    const hdDisplayControls = document.getElementById('hdDisplayControls');
 
     boardColumn.classList.toggle('is-hd-map', isHd);
     boardEl.classList.toggle('hidden', isHd);
@@ -1758,9 +1885,10 @@
       btnToggle.textContent = isHd ? '切換戰略圖' : '切換高清圖';
       btnToggle.disabled = !board25d;
     }
-    if (hdHint) hdHint.classList.toggle('hidden', !isHd);
+    hdDisplayControls.classList.toggle('hidden', !isHd);
 
     hdDragging = false;
+    hdRotating = false;
     if (board25d) {
       board25d.setActive(isHd);
       if (isHd) {
@@ -1772,6 +1900,7 @@
       const view = getBoardView();
       renderBoard(view);
       updateHoverVisuals();
+      renderInspector(view);
       renderCombatPreview();
     }
   }
@@ -1922,15 +2051,6 @@
       onTileHover(x, y);
     });
 
-    const clearBoardHover = () => {
-      if (!hoveredTile && !previewPath.length) return;
-      hoveredTile = null;
-      previewPath = [];
-      updateHoverVisuals();
-      renderInspector();
-      renderCombatPreview();
-    };
-
     boardEl.addEventListener('pointerleave', (e) => {
       if (!e.relatedTarget || !boardEl.contains(e.relatedTarget)) {
         clearBoardHover();
@@ -1943,16 +2063,21 @@
         onTileClick: (x, y) => onTileClick(x, y),
         onTileHover: (x, y) => onTileHover(x, y),
         onPointerLeave: () => clearBoardHover(),
-        onCameraChange: ({ zoom, isDragging }) => {
-          hdDragging = Boolean(isDragging);
+        onQualityChange: updateHdQuality,
+        onCameraChange: ({ zoom, isDragging, isRotating = false }) => {
+          const rotationStarted = isRotating && !hdRotating;
+          hdRotating = isRotating;
+          hdDragging = Boolean(isDragging || isRotating);
           updateHdZoomBadge(zoom);
+          if (rotationStarted) clearBoardHover();
           if (hdDragging) {
             hideCombatHoverTooltip();
           } else {
             positionCombatHoverTooltip();
           }
         }
-      });
+      }, { quality: hdQuality });
+      updateHdQuality({ quality: hdQuality });
     }
 
     boardInitialized = true;
@@ -2042,7 +2167,7 @@
     floatEffects = [];
     ambushFlashCoord = null;
     confirmationAction = null;
-    board25d?.clearEffects();
+    resetHdView();
     document.getElementById('board').classList.remove('blue-turn-pulse');
     for (const id of MODAL_IDS) document.getElementById(id).classList.add('hidden');
 
@@ -2346,16 +2471,7 @@
     state.reachableMap.clear();
 
     const movement = performMoveStepByStep(unit, targetInfo.path);
-    if (movement.steps.length > 1) {
-      emitBoard25dEffect({
-        type: 'move',
-        unitId: unit.id,
-        faction: unit.faction,
-        steps: movement.steps,
-        isCharge: isChargeActive(unit, movement.displacement, state),
-        durationMs: Math.min(460, 150 + (movement.steps.length - 1) * 85)
-      });
-    }
+    emitBoard25dMovement(unit, movement);
     state.chargeDisplacementThisTurn = movement.displacement;
     if (movement.ambushEnemy) {
       state.attackableIds.clear();
@@ -2404,16 +2520,27 @@
     const defenderName = factionName(target.faction) + UNIT_DEFS[target.type].name;
     const attackLabel = isStandingAttack ? '原地攻擊' : '移動攻擊';
     const viewers = ['blue', 'red'];
+    const { faction: viewer, showAll } = getBoardView();
+    const canSeeOrigin = showAll || viewer === attacker.faction || attackerObserved;
+    const speed = hdEffectSpeed();
+    const playsArrow = canSeeOrigin && attacker.type === 'archer';
+    const attackDuration = (playsArrow ? 460 : 380) * speed;
+    const impactFrac = hdReducedMotion.matches ? 0 : (playsArrow ? 0.62 : 0.48);
+    const moveDelay = !hdReducedMotion.matches && hdMovement?.unitId === attacker.id
+      ? Math.max(0, hdMovement.endMs - performance.now()) : 0;
 
     if (attackerObserved && isAiControlled(target.faction)) {
       matchHost.notifyEnemySeenAction(state, target.faction, attacker.id, attacker.x, attacker.y, 'attack');
     }
+    const defenderBeforeHit = snapshotHdUnit(target);
     const defenderLoss = applyCombatDamage(target, result.damage);
     if (!attackerObserved && isAiControlled(target.faction)) {
       matchHost.notifyFogAttack(state, target.faction, target, defenderLoss, result.canCounter);
     }
     state.turnsSinceDamage = 0;
     state.damageThisTurn = true;
+    const damageText = result.isShattered ? `破盾 -${defenderLoss}` : `-${defenderLoss}`;
+    const damageColor = result.isShattered ? '#fbbf24' : '#ef4444';
     emitBoard25dEffect({
       type: 'attack',
       attackerId: attacker.id,
@@ -2425,14 +2552,21 @@
       toX: target.x,
       toY: target.y,
       attackerObserved,
+      canSeeOrigin,
+      targetKilled: !target.alive,
+      targetSnapshot: defenderBeforeHit,
       isCharge: Boolean(result.atkRes.charged),
       isShattered: Boolean(result.isShattered),
       isCounter: false,
       viewers,
-      durationMs: attacker.type === 'archer' ? 460 : 380
+      delayMs: moveDelay,
+      durationMs: attackDuration,
+      impactFrac,
+      damageText,
+      damageColor,
+      deathDurationMs: 600 * speed
     });
-    addFloatEffect(target.x, target.y, result.isShattered ? `破盾 -${defenderLoss}` : `-${defenderLoss}`,
-      result.isShattered ? '#fbbf24' : '#ef4444', viewers);
+    addFloatEffect(target.x, target.y, damageText, damageColor, viewers, { classicOnly: true });
 
     const defeated = target.alive ? '' : ` ${defenderName}陣亡！`;
     const outcome = `${defenderName}(${target.x},${target.y})${result.isShattered ? '【破盾衝散⚡】' : ''}，造成 ${defenderLoss} 傷（剩 ${target.hp}/${target.maxHp}）。${defeated}`;
@@ -2446,7 +2580,9 @@
     let counterMarkers = [];
     if (result.canCounter) {
       recordReplayFrame('combat', attackMessages, attackMarkers);
+      const attackerBeforeCounter = snapshotHdUnit(attacker);
       const attackerLoss = applyCombatDamage(attacker, result.counterDamage);
+      const counterDamageText = attackerLoss > 0 ? `反擊 -${attackerLoss}` : '反擊 0';
       emitBoard25dEffect({
         type: 'attack',
         attackerId: target.id,
@@ -2458,15 +2594,21 @@
         toX: attacker.x,
         toY: attacker.y,
         attackerObserved: true,
+        canSeeOrigin: true,
+        targetKilled: !attacker.alive,
+        targetSnapshot: attackerBeforeCounter,
         isCharge: false,
         isShattered: false,
         isCounter: true,
         viewers: attackerViewers,
-        delayMs: 220,
-        durationMs: 340
+        delayMs: moveDelay + attackDuration * impactFrac + 44 * speed,
+        durationMs: 340 * speed,
+        impactFrac: hdReducedMotion.matches ? 0 : 0.48,
+        damageText: counterDamageText,
+        damageColor: '#facc15',
+        deathDurationMs: 600 * speed
       });
-      addFloatEffect(attacker.x, attacker.y, attackerLoss > 0 ? `反擊 -${attackerLoss}` : '反擊 0',
-        '#facc15', attackerViewers);
+      addFloatEffect(attacker.x, attacker.y, counterDamageText, '#facc15', attackerViewers, { classicOnly: true });
       counterText = ` ${defenderName}反擊 ${attackerLoss} 傷（攻方剩 ${attacker.hp}/${attacker.maxHp}）。`;
       if (!attacker.alive) counterText += ` ${attackerName}陣亡！`;
       counterMessages = replayMessages(attacker.faction, counterText.trim(),
@@ -2737,16 +2879,7 @@
         } else {
           const initiallyVisible = new Set(state.visionByFaction[faction].detectedEnemyIds);
           const movement = performMoveStepByStep(unit, action.path);
-          if (movement.steps.length > 1) {
-            emitBoard25dEffect({
-              type: 'move',
-              unitId: unit.id,
-              faction: unit.faction,
-              steps: movement.steps,
-              isCharge: isChargeActive(unit, movement.displacement, state),
-              durationMs: Math.min(460, 150 + (movement.steps.length - 1) * 85)
-            });
-          }
+          emitBoard25dMovement(unit, movement);
           matchHost.notifySelfAction(state, faction, {
             actionType: action.type,
             unitId: unit.id,
@@ -2917,10 +3050,10 @@
     if (state.logs.length > 140) state.logs.pop();
   }
 
-  function addFloatEffect(x, y, text, color, viewers) {
+  function addFloatEffect(x, y, text, color, viewers, { classicOnly = false } = {}) {
     const game = state;
     const createdAt = typeof performance === 'object' ? performance.now() : Date.now();
-    const effect = { x, y, text, color, viewers, createdAt };
+    const effect = { x, y, text, color, viewers, createdAt, hdViewEpoch, classicOnly };
     floatEffects.push(effect);
     setTimeout(() => {
       if (state !== game) return;
@@ -3227,7 +3360,7 @@
     replay = { record, imported, returnToVictory, resumeAi, index: 0, view: 'all', speed: 1, playing: false, timer: null, turnIndex };
     hoveredTile = null;
     previewPath = [];
-    board25d?.clearEffects();
+    resetHdView();
     document.getElementById('board').classList.remove('blue-turn-pulse');
 
     const turnJump = document.getElementById('replayTurnJump');
@@ -3252,7 +3385,7 @@
     replayLoadId++;
     hoveredTile = null;
     previewPath = [];
-    board25d?.clearEffects();
+    resetHdView();
     showReplayFileNotice();
     renderAll();
     if (returnToVictory && state.phase === 'GAME_OVER') showVictoryModal();
@@ -3266,6 +3399,7 @@
   function seekReplay(index) {
     if (!replay || !Number.isInteger(index)) return;
     pauseReplay();
+    resetHdView();
     replay.index = Math.min(replay.record.frames.length - 1, Math.max(0, index));
     renderAll();
   }
@@ -3618,7 +3752,11 @@
   /**
    * 建構 2.5D 高清圖所需的場景快照（與經典戰略圖同源，嚴格遵守迷霧）
    */
-  function buildBoard25dScene(view, selUnit, ghostAt) {
+  function snapshotHdUnit({ id, type, faction, x, y, hp, maxHp }) {
+    return { id, type, faction, x, y, hp, maxHp };
+  }
+
+  function buildBoard25dScene(view, selUnit, ghostAt, viewKey) {
     const { board, frame, faction: viewer, vision: vv, showAll, markers } = view;
     const activeSel = (selUnit && state.phase !== 'LOCKED_END' && state.phase !== 'GAME_OVER') ? selUnit : null;
     const canShowReachable = Boolean(!frame && !isAiVsAi() && !state.aiThinking && state.phase === 'SELECT_OR_ACT' && activeSel);
@@ -3626,6 +3764,7 @@
 
     const zocKeys = new Set();
     const reachableKeys = new Set();
+    const reachableMap = new Map();
     const chargeKeys = new Set();
     const enemyTrailKeys = new Set();
     const enemyAttackKeys = new Set();
@@ -3661,15 +3800,17 @@
         if (!showAll && isInEnemyShieldZoc(x, y, viewer, vv, board)) {
           zocKeys.add(k);
         }
-        if (canShowReachable && state.reachableMap.has(k)) {
+        const reach = canShowReachable ? state.reachableMap.get(k) : null;
+        if (reach) {
           reachableKeys.add(k);
+          reachableMap.set(k, { cost: reach.cost });
           if (activeSel.type === 'cavalry' && manhattan(activeSel.x, activeSel.y, x, y) >= 3 && cell.terrain !== 'forest') {
             chargeKeys.add(k);
           }
         }
         const unit = getVisibleUnitAt(x, y, view);
         if (unit) {
-          visibleUnitsByKey.set(k, unit);
+          visibleUnitsByKey.set(k, snapshotHdUnit(unit));
           unitMetaById.set(unit.id, {
             hasAura: (unit.faction === viewer || showAll) && hasFlagAura(unit, board),
             support: Math.min(2, countVisibleAdjacentSameFaction(unit, view)),
@@ -3680,13 +3821,16 @@
     }
 
     return {
-      board,
-      frame,
+      // Canvas 只接收公開地形與這個視角已經可以辨認的資料。
+      board: { map: board.map, turn: board.turn },
+      frame: Boolean(frame),
+      viewKey,
+      animateFog: !frame && !showAll,
       faction: viewer,
-      vision: vv,
+      vision: { tileVisible: vv.tileVisible, forestReveal: vv.forestReveal },
       showAll,
-      selUnit: activeSel,
-      reachableMap: canShowReachable ? state.reachableMap : null,
+      selUnit: activeSel ? snapshotHdUnit(activeSel) : null,
+      reachableMap,
       reachableKeys,
       chargeKeys,
       attackableIds: canShowAttackable ? state.attackableIds : new Set(),
@@ -3698,7 +3842,8 @@
       unitMetaById,
       ghostsByKey: ghostAt,
       markersByKey,
-      floatEffects: frame ? [] : floatEffects
+      floatEffects: frame ? [] : floatEffects.filter(effect =>
+        !effect.classicOnly && effect.hdViewEpoch === hdViewEpoch && (showAll || effect.viewers.includes(viewer)))
     };
   }
 
@@ -3720,7 +3865,10 @@
     }
 
     if (isHdMap()) {
-      board25d.setScene(buildBoard25dScene(view, selUnit, ghostAt));
+      const viewKey = `${frame ? 'replay' : 'live'}:${showAll ? 'all' : viewer}`;
+      if (hdViewKey !== null && hdViewKey !== viewKey) resetHdView();
+      hdViewKey = viewKey;
+      board25d.setScene(buildBoard25dScene(view, selUnit, ghostAt, `${viewKey}:${hdViewEpoch}`));
       return;
     }
 
@@ -4025,6 +4173,27 @@
   function hideCombatHoverTooltip() {
     const tip = document.getElementById('combatHoverTooltip');
     if (tip) tip.classList.add('hidden');
+  }
+
+  function discardBoardHover() {
+    hoveredTile = null;
+    previewPath = [];
+    activeCombatHoverTarget = null;
+    hideCombatHoverTooltip();
+  }
+
+  function clearBoardHover() {
+    if (!hoveredTile && !previewPath.length && !activeCombatHoverTarget) return;
+    discardBoardHover();
+    updateHoverVisuals();
+    renderInspector();
+    renderCombatPreview();
+  }
+
+  function resetHdCamera() {
+    if (!isHdMap() || isAnyModalOpen()) return;
+    clearBoardHover();
+    board25d.resetCamera();
   }
 
   function positionCombatHoverTooltip() {
@@ -4460,6 +4629,7 @@
       region.classList.toggle('handover-covered', privateHandover);
     }
     if (modal) {
+      releaseHdAlt();
       modal.querySelector('[data-initial-focus]')?.focus({ preventScroll: true });
     } else if (focusBeforeModal) {
       focusBeforeModal.focus({ preventScroll: true });
@@ -4561,8 +4731,29 @@
   document.getElementById('btnHdRotRight').addEventListener('click', () => {
     if (isHdMap()) board25d.rotate(1);
   });
-  document.getElementById('btnHdResetCam').addEventListener('click', () => {
-    if (isHdMap()) board25d.resetCamera();
+  document.getElementById('btnHdResetCam').addEventListener('click', resetHdCamera);
+  document.getElementById('hdQualityBtn').addEventListener('click', () => {
+    if (!isHdMap() || isAnyModalOpen()) return;
+    const quality = hdQuality === 'high' ? 'standard' : 'high';
+    hdQualityNotice = false;
+    board25d.setQuality(quality);
+    updateHdQuality({ quality });
+    try {
+      window.localStorage.setItem(HD_QUALITY_STORAGE_KEY, quality);
+    } catch {
+      // 畫質仍可在當前分頁切換。
+    }
+  });
+  document.getElementById('hdDetailsBtn').addEventListener('click', () => {
+    if (!isHdMap() || isAnyModalOpen()) return;
+    hdDetailsPinned = !hdDetailsPinned;
+    updateHdDetails();
+  });
+  document.getElementById('hdGridBtn').addEventListener('click', (event) => {
+    if (!isHdMap() || isAnyModalOpen()) return;
+    hdGridVisible = !hdGridVisible;
+    event.currentTarget.setAttribute('aria-pressed', String(hdGridVisible));
+    board25d.setGridVisible(hdGridVisible);
   });
   window.addEventListener('resize', () => {
     if (isHdMap()) board25d.resize();
@@ -4635,6 +4826,15 @@
   });
 
   window.addEventListener('keydown', (event) => {
+    if (event.key === 'Alt' && !event.ctrlKey && !event.metaKey && !isAnyModalOpen() && isHdMap() &&
+        !event.target.closest?.('input, select, textarea, [contenteditable]')) {
+      event.preventDefault();
+      if (!hdAltHeld) {
+        hdAltHeld = true;
+        updateHdDetails();
+      }
+      return;
+    }
     if (event.key === 'Escape') {
       const modal = visibleModal();
       if (modal?.id === 'confirmModal') dismissConfirmation();
@@ -4647,12 +4847,13 @@
         const k = event.key.toLowerCase();
         if (k === 'q') { event.preventDefault(); board25d.rotate(-1); return; }
         if (k === 'e') { event.preventDefault(); board25d.rotate(1); return; }
-        if (k === 'r') { event.preventDefault(); board25d.resetCamera(); return; }
+        if (k === 'r') { event.preventDefault(); resetHdCamera(); return; }
         if (k === '+' || k === '=') { event.preventDefault(); board25d.zoomBy(1.22); return; }
         if (k === '-' || k === '_') { event.preventDefault(); board25d.zoomBy(1 / 1.22); return; }
       }
     }
-    if (replay || isAiVsAi() || event.code !== 'Space' || isAnyModalOpen() || state.aiThinking) return;
+    if (replay || isAiVsAi() || event.code !== 'Space' || event.altKey || event.ctrlKey || event.metaKey ||
+        isAnyModalOpen() || state.aiThinking) return;
     if (event.target.closest('button, input, select, textarea, summary') && event.target.id !== 'btnEndTurn') return;
     if (state.phase === 'LOCKED_END' || state.phase === 'POST_MOVE_ATTACK') {
       event.preventDefault();
@@ -4660,6 +4861,11 @@
       document.getElementById('btnEndTurn').click();
     }
   });
+
+  window.addEventListener('keyup', (event) => {
+    if (event.key === 'Alt') releaseHdAlt();
+  });
+  window.addEventListener('blur', releaseHdAlt);
 
   document.getElementById('btnRules').addEventListener('click', () => {
     if (replay?.playing) {
