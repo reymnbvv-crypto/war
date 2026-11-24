@@ -155,6 +155,9 @@
 
 ## 六、近期對話紀錄（Session Log）
 
+- **2026-11-23｜修復 GitHub Pages 部署偶發失敗（單 Job 產物競態）與升級 Actions 至 Node 24**
+  - **問題定位**：檢查 commit `1c4f125` 觸發之失敗部署（Run `45339517471`），確認 `_site` 組裝與 `Upload Pages artifact` 均成功完成（`Artifact ID 14895307306`），但因舊版 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml) 將 `upload-pages-artifact` 與 `deploy-pages` 緊鄰置於同一 `build_and_deploy` Job 內，導致 `deploy-pages` 在產物剛 finalize 僅約 340ms 後即查詢 Artifact API 並踩中最終一致性延遲（回傳 `Found 0 artifact(s)`、`Error: No artifacts named "github-pages" were found for this workflow run`）；另發現舊版 Actions 觸發 Node.js 20 棄用警告。
+  - **修復內容**：依 GitHub Pages 官方建議將 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml) 拆分為 `build` 與 `deploy`（`needs: build`）雙 Job，消除同 Job 內產物查詢競態並確保 `github-pages` 環境僅綁定於部署階段；同步升級 `actions/checkout@v7`、`actions/upload-pages-artifact@v5` 與 `actions/deploy-pages@v5` 以原生運行於 Node.js 24。
 - **2026-11-23｜右側數值介面硬性定高與零抖動優化（選項 A）**
   - **問題定位**：實測 `1366×900` 視窗下 `#inspectorCard` 隨懸停目標於 `74px～309px` 伸縮，且跨過 `900px` 視窗臨界導致瀏覽器右側捲軸反覆出現／消失，引發整頁與 2.5D Canvas 嚴重左右及上下抖動。
   - **拍板與實作**：僅調整 [`index.html`](./index.html)（不動核心引擎與 AI）：桌面端鎖死 `#inspectorCard` 為硬性固定高度 **`324px`**（內部採 Flex + `thin-scroll` 溢出保護）、`html` 加上 `scrollbar-gutter: stable`、鎖定 `#statusBanner`（`42px`）與 `#actionSubHint`（`2.35rem`）最小高度，並依選項 A 將 `#battleLog` 調整為與左欄切齊（`pve`/`hotseat` `11.25rem`，`aivai`/`replaying` 自動縮至 `7.5rem`）。
