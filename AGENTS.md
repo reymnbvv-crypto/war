@@ -49,6 +49,12 @@
 - **網頁多檔匯入與規則下載**：
   - 「匯入 AI」支援一次多選與分次累加 `.js` 檔，**僅限當次分頁有效（不存 `localStorage`、不改寫儲存庫）**；同檔名重匯入採熱更新覆蓋，不同檔名同 `id` 自動配發區隔 ID 供同台競技。
   - 規則彈窗（`#rulesModal`）提供單一真相源 [`AI_PROTOCOL.md`](./AI_PROTOCOL.md) 下載按鈕與本機匯入入口。
+- **雙地圖模式切換（戰略圖 ↔ 2.5D 高清圖）**：
+  - 地圖正下方以單一按鈕切換（`切換高清圖` ↔ `切換戰略圖`），初次預設為**戰略圖**（記憶於 `localStorage`）；可於人機／熱座／AI 對弈／回放中即時無縫切換。
+  - 2.5D 高清圖（[`render/board-25d.js`](./render/board-25d.js)）為純原生 Canvas 2D 奇幻自然地景微縮沙盤與純造型兵種，支援游標中心縮放、6px 防誤觸平移、4 向 90° 旋轉、逆畫家序解析點格（`resize()` 須量測 `canvas.getBoundingClientRect()` 避免外框邊界偏移）與嚴格迷霧零洩密動畫。
+- **戰鬥預測（方案 C）與棋子懸停簡潔小窗**：
+  - 右側「單位與地形檢視」與「即時戰鬥預測拆解」採同區切換（零版面跳動），唯有選中己方單位並懸停於可攻擊敵軍上方時才切換顯示預測，同時於該敵子上方浮現簡潔攻防／反擊小窗（雙模式共用、嚴格呼叫 `createObservedBoard` 遵守迷霧）。
+  - CSS `.hidden` 須維持 `display: none !important;` 避免被 `.spectator-panel` 等 `display: flex` 規則覆寫；「AI 對弈觀戰」與「藍方 AI」僅於 `aivai` 模式顯示，頂部「AI 難度」選單維持於各模式顯示（熱座時停用）。
 - **彈窗與焦點管理**：所有模態視窗統一納入 `MODAL_IDS`，經由 `setModalOpen` / `syncModalState` 控制 `inert` 與焦點還原。
 
 ---
@@ -57,14 +63,15 @@
 
 - **[`core/engine.js`](./core/engine.js)**：純規則引擎（常數、地形、`hasLineOfSight`、`computeVisionData`、`isInEnemyShieldZoc`、`computeReachableFor`、`previewCombat`、`evaluateVictory`、`evaluateTurnLimitVictory`、`generateLegalActions`、`validateAction`）。
 - **[`core/ai-host.js`](./core/ai-host.js)**：TFC AI Protocol v1 宿主（180° 鏡像適配層、`createRulesSdk`、`validateManifest`、`createRegistry`、`evaluateAiSource`、`discoverAndLoadBrowserAis`、`createMatchHost`）。
+- **[`render/board-25d.js`](./render/board-25d.js)**：2.5D 高清奇幻微縮沙盤渲染器（純 Canvas 2D、4 向旋轉、縮放／平移、逆畫家序精確點格、純造型五兵種、迷霧零洩密特效）。
 - **[`ai/`](./ai/)**（純熱插拔演算法槽，單檔自包含）：
   - `recruit.js`、`warrior.js`、`general.js`、`marshal.js`、`wargod.js`（清空即為無演算法版本）。
-- **[`index.html`](./index.html)**：靜態樣式、頂部控制列、棋盤／觀戰／回放／檢視／戰報渲染、人類操作、多檔匯入 AI、`AI_PROTOCOL.md` 下載與 `bootstrapGame` 自動探索啟動。
+- **[`index.html`](./index.html)**：靜態樣式、頂部控制列、戰略圖 DOM／2.5D 渲染橋接／觀戰／回放／方案 C 檢視預測／戰報渲染、人類操作、多檔匯入 AI、`AI_PROTOCOL.md` 下載與 `bootstrapGame` 自動探索啟動。
 - **[`tools/`](./tools/)**：
   - [`tools/verify-ai.mjs`](./tools/verify-ai.mjs)：單檔或全目錄協議合規、合法步、Worker 沙盒隔離、迷霧零作弊審計與中止健檢。
   - [`tools/arena.mjs`](./tools/arena.mjs)：無頭自動對戰與全循環賽裁判。
 - **[`AI_PROTOCOL.md`](./AI_PROTOCOL.md)**：純規則＋TFC AI Protocol v1 完整開發手冊與無策略空殼範本。
-- **[`.github/workflows/pages.yml`](./.github/workflows/pages.yml)**：GitHub Pages 部署自動產生 `ai/manifest.json` 流程。
+- **[`.github/workflows/pages.yml`](./.github/workflows/pages.yml)**：GitHub Pages 部署組裝靜態產物（含 `render/`）並自動產生 `ai/manifest.json` 流程。
 
 ---
 
@@ -74,7 +81,7 @@
 
 1. **演算法合規與零作弊審計（動到 `core/` 或 `ai/` 時必做）**：執行 `node tools/verify-ai.mjs`（或指定單檔），驗證契約、合法動作、Worker 沙盒與迷霧零作弊 100% 通過。
 2. **無頭對戰回歸測試（動到引擎或演算法時必做）**：執行 `node tools/arena.mjs` 驗證多盤藍紅交替正常完賽。
-3. **DOM 與語法完整性**：確認 `core/*.js`、`ai/*.js`、`tools/*.mjs` 與 `index.html` 內嵌腳本無語法錯誤，且所有 `document.getElementById(...)` 皆對應實際 HTML `id`。
+3. **DOM 與語法完整性**：確認 `core/*.js`、`render/*.js`、`ai/*.js`、`tools/*.mjs` 與 `index.html` 內嵌腳本無語法錯誤，且所有 `document.getElementById(...)` 皆對應實際 HTML `id`。
 4. **0-AI / 單 AI / 多檔匯入與自動探索驗證（動到本體載入或 UI 時必做）**：驗證清空 `ai/`（0 演算法）開箱可運作、多選重複 `id` 匯入對戰、以及本地 HTTP 目錄自動探索零 404。
 5. **既有 AI 回歸檢查（動到共用宿主或事件流時必做）**：固定種子下比對既有難度輸出無非預期偏移。
 6. **回放相容測試（動到 UI／模式／回放時必做）**：驗證舊版 v1 回放與未知自訂演算法 `id` 回放於 0-AI／多 AI 狀態下皆可編解碼播放。

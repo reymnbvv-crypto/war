@@ -6,11 +6,12 @@
 
 ## 一、目前狀態快照（Current Snapshot）
 
-- **最新架構形態**：零外部套件、零建置鏈純靜態模組架構（[`index.html`](./index.html) 約 4,050 行 + [`core/engine.js`](./core/engine.js) + [`core/ai-host.js`](./core/ai-host.js) + 5 支完全自包含單檔 [`ai/*.js`](./ai/) + [`tools/`](./tools/) CLI 驗證與對戰工具）
+- **最新架構形態**：零外部套件、零建置鏈純靜態模組架構（[`index.html`](./index.html) + [`core/engine.js`](./core/engine.js) + [`core/ai-host.js`](./core/ai-host.js) + [`render/board-25d.js`](./render/board-25d.js) + 5 支完全自包含單檔 [`ai/*.js`](./ai/) + [`tools/`](./tools/) CLI 驗證與對戰工具）
+- **雙地圖模式**：預設**戰略圖**（經典 10×10 靜態 DOM 方格）與 **2.5D 高清圖**（奇幻自然地景微縮沙盤＋純造型五兵種＋縮放／平移／4 向旋轉＋迷霧零洩密特效），由地圖下方單一按鈕即時切換並記憶於 `localStorage`
 - **核心文件體系**：[`README.md`](./README.md)（玩家／架構手冊）、[`AI_PROTOCOL.md`](./AI_PROTOCOL.md)（TFC AI Protocol v1 自製演算法規範書，可於規則頁直接下載）、[`AGENTS.md`](./AGENTS.md)（開發憲法）、[`PROGRESS.md`](./PROGRESS.md)（進度與基準帳本）
-- **對戰模式**：人機對戰（`pve`）、雙人熱座（`hotseat`）、AI 對弈觀戰（`aivai`，開局待命、預設全圖、三視野即時切換）；完整支援 **0 演算法白板模式**（刪空 `ai/*.js` 即得純淨無演算法版本）與**網頁多檔匯入對戰**
+- **對戰模式**：人機對戰（`pve`）、雙人熱座（`hotseat`）、AI 對弈觀戰（`aivai`，開局待命、預設全圖、三視野即時切換，觀戰面板僅於本模式顯示）；完整支援 **0 演算法白板模式**（刪空 `ai/*.js` 即得純淨無演算法版本）與**網頁多檔匯入對戰**
 - **內附 AI 演算法（共 5 支獨立單檔，皆嚴格零作弊）**：`ai/recruit.js`（新兵）、`ai/warrior.js`（戰士）、`ai/general.js`（將軍）、`ai/marshal.js`（元帥）、`ai/wargod.js`（軍神）
-- **回放規格**：`.tfc-replay.json`（`format: "tactical-fog-chess-replay"`、`version: 1`，向下相容舊版 `pve` / `hotseat` / `aivai` 回放，亦相容未知自訂演算法 `id` 與 0-AI 環境載入播放）
+- **回放規格**：`.tfc-replay.json`（`format: "tactical-fog-chess-replay"`、`version: 1`，向下相容舊版 `pve` / `hotseat` / `aivai` 回放，亦相容未知自訂演算法 `id`、0-AI 環境與雙地圖模式切換播放）
 
 ---
 
@@ -43,6 +44,10 @@
 7. **經使用者授權升級「將軍（`general`）」為方案 A，拉開與戰士差距並維持元帥上限（2026-11-23）**
    - **問題診斷**：原版 `ai/general.js` 雖配置了 64K TT 陣列卻未對將軍啟用，Depth 3 寬度反較元帥更寬（`6×5`），且關閉戰術評估（`tactical = false`，漏看輕騎衝鋒線與雙重威脅）、根候選池僅 10 手（窄於戰士的 12 手）、僅 4 世界零尾部風險防護且做完 D3+Q1 即中止，導致對戰士優勢不穩（原 BO6 `3:3`，本地 32 局 `24:8`）。
    - **方案 A 改動（僅動 [`ai/general.js`](./ai/general.js) 單檔，其餘四階 AI 維持原鎖定不動）**：啟用既有 64K TT 與最佳步排序、將寬度調為 `fast:4`／深度層 `4`（殘局 `3`）、開啟 `evaluate(..., tactical = true)`、根池擴至 `14`、世界數升至 `6`（含最後 1 個高風險伏擊世界）、風險聚合改為 `0.85 avg + 0.15 worst`、靜態延伸改為 `Q2` 並於預算充裕時對前 8 手深化至 `Depth 4 + Q2`，時間預算微調至 `750ms / 900ms`（`minTime: 400ms`）。
+8. **2.5D 高清奇幻微縮沙盤與介面優化定案（2026-11-23）**
+   - **零依賴獨立視覺模組**：新建 [`render/board-25d.js`](./render/board-25d.js)（純原生 Canvas 2D、HiDPI、奇幻自然地景＋純造型五兵種＋前景 HUD 層防血條截切），保留原 `#board` 100 格靜態 DOM 作為預設「**戰略圖**」，地圖正下方以單一按鈕即時切換（`切換高清圖` ↔ `切換戰略圖`，記憶於 `localStorage`），對引擎與五階 AI 零改動。
+   - **精確解析命中與鏡頭操控**：棄用會受 Canvas 2D 多邊形反鋸齒邊緣污染的 Color-ID Picking，改採**逆畫家序解析點格**（零縫隙、零 GPU 回讀延遲、保留高地岩壁 1px 外緣防搶鄰格）並於 `resize()` 量測 `canvas.getBoundingClientRect()`；支援游標中心滾輪縮放（`85%～240%`）、雙指縮放、6px 防誤觸平移拖曳、4 向 90° 旋轉（工具列與 `Q`/`E`/`R`/`+`/`-`）與嚴格迷霧零洩密特效（敵軍暗箭不繪起點、迷霧移動不繪未偵測段）。
+   - **UI 優化與既有 Bug 修復**：修復 `.hidden { display: none !important; }` 使「AI 對弈觀戰」面板與「藍方 AI」於非 `aivai` 模式真正隱藏（保留「AI 難度」選單於熱座原樣顯示並停用）；右側採**方案 C**（檢視與即時戰鬥預測同區切換，唯有選中己方單位並懸停可攻敵軍時顯示，零版面抖動）；雙模式皆於可攻敵子上方顯示迷霧合規「預計攻擊＆反擊」簡潔懸停小窗；高清圖大螢幕適度放寬至 `780px`、拉高戰報捲動區，並同步 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml) 複製 `render/*.js`。
 
 ---
 
@@ -85,12 +90,12 @@
 ### 4. 核心安全、模組化拆分與功能回歸驗證
 - **Golden Master 回歸（對照 `1342e8c` 原版單檔 `index.html`）**：拆出 `core/` 與 5 支獨立 `ai/*.js` 後，固定種子逐手驗證 `recruit`（16 步）、`warrior`（20 步）、`general`（8 步）、`marshal`（6 步）、`wargod`（6 步）全部 **100% bit-for-bit 一致**。
 - **`node tools/verify-ai.mjs` 全通過**：5 支獨立演算法檔（含方案 A 升級後之 `ai/general.js`）＋`AI_PROTOCOL.md` 最小空殼範本全數通過協議契約、藍紅雙陣營嚴格合法步（`strict: true`）、乾淨 `vm` Worker 沙盒隔離、藍紅雙向迷霧零作弊審計與 Abort／Dispose 健檢。
-- **0-AI / 多檔匯入 / HTTP 自動探索 / 回放相容端對端驗證**：
-  - `file://` 與空 `ai/` 0-AI 啟動自動切換熱座且零崩潰、不遮擋操作列；
+- **0-AI / 多檔匯入 / HTTP 自動探索 / 雙地圖與回放相容端對端驗證**：
+  - `file://` 與空 `ai/` 0-AI 啟動自動切換熱座且零崩潰、支援 2.5D 高清圖切換與 v1 未知演算法回放播放；
   - 一次多選匯入 2 支同 `id` 檔＋壞檔容錯、自動區隔編號（`my_bot` vs `my_bot#2`）、同檔名熱覆蓋、分次累加並成功於 `aivai` 單步開打；
   - 真實 `python3 -m http.server` 下自動探索載入全部 5 支 `ai/*.js`（零 `manifest.json` 404），`AI_PROTOCOL.md` 下載端點回傳 200；
-  - 原版 `pve` / `hotseat` / `aivai` v1 回放檔與未知自訂演算法 `id` 回放檔於 0-AI 狀態下皆成功解碼；
-  - `index.html` 語法與 73 個獨立 DOM ID 完整吻合。
+  - Chromium Playwright 真實瀏覽器驗證：戰略圖預設啟動、觀戰面板於非 `aivai` 確實隱藏、2.5D 高清圖 4 向旋轉點格、高地後方平地 `(8,4)` 精準點擊、6px 防誤觸平移、游標中心滾輪縮放、方案 C 同區切換、雙模式懸停戰鬥小窗與迷霧零洩密、手機 `390×844` 零水平溢位；
+  - `index.html` 與 `render/board-25d.js` 語法與 86 個獨立 DOM ID 完整吻合。
 
 ### 5. 將軍（`general`）方案 A 專項補充驗證（緊預算與深度採樣，2026-11-23）
 - **多組種子專項對照（對戰士 44 局、藍紅各半）**：合計 **41–3（93.2%）**（含同種子 `--seed 100` `9–3 → 11–1`、`--seed 1` `15–5 → 19–1`，以及 `--budget 250` 模擬慢速裝置／`file://` 時間切片 **11–1**）；對元帥小樣本測試曾打出 **2–4**。
@@ -116,6 +121,9 @@
 
 ## 四、已完成里程碑（Completed Milestones）
 
+- **2026-11-23（2.5D 高清奇幻微縮沙盤地圖模式與介面全面優化）**
+  - 新增零外部依賴 2.5D 等角奇幻沙盤渲染模組 [`render/board-25d.js`](./render/board-25d.js)（層岩苔草高地、多層松林、飄動迷霧雲、純造型五兵種微縮模型、前景不截切血條與微徽章、游標縮放／6px 防誤觸平移／4 向 90° 旋轉、逆畫家序解析點格、嚴格迷霧零洩密特效）。
+  - 於 [`index.html`](./index.html) 保留經典戰略圖為預設、於地圖下方新增單一 `切換高清圖`／`切換戰略圖` 按鈕；修復 `.hidden` CSS 覆蓋 Bug 使「AI 對弈觀戰」與「藍方 AI」於其他模式確實隱藏（AI 難度選單維持原樣）；實作右側方案 C 檢視／戰鬥預測同區切換與雙模式可攻敵子懸停簡潔攻防／反擊小窗；同步更新 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml)、[`README.md`](./README.md)、[`AGENTS.md`](./AGENTS.md) 與 [`PROGRESS.md`](./PROGRESS.md)。
 - **2026-11-23（將軍難度方案 A 升級與新版四難度 BO8 循環賽基準）**
   - 經使用者授權僅調整單檔 [`ai/general.js`](./ai/general.js)（其餘四階 AI 維持零改動），修復 TT 停用、Depth 3 寬度過胖與戰術盲點；在新版四難度 48 局 BO8 循環賽中形成清晰對稱的四階梯：**元帥 23/24（95.8%）> 將軍 17/24（70.8%）> 戰士 7/24（29.2%）> 新兵 1/24（4.2%）**。
 - **2026-11-22（演算法全面單檔化與 TFC AI Protocol v1 里程碑）**
@@ -147,6 +155,10 @@
 
 ## 六、近期對話紀錄（Session Log）
 
+- **2026-11-23｜新增 2.5D 高清奇幻微縮沙盤地圖模式與介面全面優化**
+  - **設計拍板**：確認採純原生 Canvas 2D **2.5D 高清圖**（奇幻自然地景微縮沙盤風、純造型五兵種、預設開啟動畫與飄霧、支援縮放／6px 防誤觸平移／4 向 90° 旋轉），預設維持**戰略圖**並於地圖下方設單一切換按鈕（`切換高清圖` ↔ `切換戰略圖`）；右側即時戰鬥預測採**方案 C**（與檢視區同區切換，僅選中己方單位並懸停可攻敵軍時顯示）並於可攻敵子旁增加遵守迷霧之簡潔攻防／反擊小窗；修復「AI 對弈觀戰」於非 `aivai` 模式誤顯示 Bug（AI 難度選單維持原樣）。
+  - **程式碼與部署變更**：新增 [`render/board-25d.js`](./render/board-25d.js)，更新 [`index.html`](./index.html)（修復 `.hidden !important`、2.5D 渲染橋接與鏡頭工具列、方案 C 卡片、雙模式懸停戰鬥小窗、高清圖大螢幕加寬與戰報高度優化、迷霧零洩密特效事件派發）與 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml)（發佈產物納入 `render/*.js`），並同步 [`README.md`](./README.md)、[`AGENTS.md`](./AGENTS.md) 與 [`PROGRESS.md`](./PROGRESS.md)。
+  - **視覺實測與驗證**：透過 Chromium Playwright 截圖目視檢修兩輪（修復初版血條被前景地塊遮切、改採前景 HUD 層、將高地由方形岩塊升級為自然懸崖苔草台面、將 Color-ID Picking 升級為零反鋸齒縫隙的逆畫家序解析點格並修復 `canvas` 邊框 2px 偏移），全數通過 4 向旋轉點格、高地後方平地點擊、方案 C、迷霧零洩密、0-AI、v1 未知演算法回放、`file://` 直開、手機響應式、`verify-ai.mjs`（5/5）與 `arena.mjs` 回歸驗證。
 - **2026-11-23｜將軍難度（`general`）方案 A 強化、規則核查、子力實證與新版四難度 BO8 循環賽**
   - **診斷與拍板**：逐行審計 [`ai/general.js`](./ai/general.js) 對比 `warrior` 與 `marshal`，定位五大結構弱點（TT 停用、Depth 3 寬度過胖 `6×5`、根池僅 10 手、關閉 `tactical` 評估、4 世界零尾部風險防護與 Q1 即停），經使用者拍板採用**方案 A**。
   - **程式碼與文件變更**：僅修改 [`ai/general.js`](./ai/general.js)（啟用 64K TT 與最佳步排序、寬度 `fast:4`／深度層 `4` 殘局 `3`、開啟 `tactical`、根池 `14`、6 世界含 1 高風險世界、`0.85 avg + 0.15 worst`、D3+Q2 與前 8 手 D4+Q2、`750ms/900ms` 預算），同步更新 [`README.md`](./README.md) 與 [`PROGRESS.md`](./PROGRESS.md)。

@@ -26,9 +26,12 @@ jobs:
 
       - name: Assemble static site and generate ai/manifest.json (deployment artifact only)
         run: |
-          mkdir -p _site/ai _site/core
+          mkdir -p _site/ai _site/core _site/render
           cp index.html AI_PROTOCOL.md README.md _site/
           cp core/*.js _site/core/
+          if compgen -G "render/*.js" > /dev/null; then
+            cp render/*.js _site/render/
+          fi
           if compgen -G "ai/*.js" > /dev/null; then
             cp ai/*.js _site/ai/
           fi
