@@ -8,92 +8,204 @@
   const SIZE = 10;
   const MASK_TILE = 32;
   const MASK_SIZE = SIZE * MASK_TILE;
-  const SLOPE_WIDTH = 0.21;
-  const PLATFORM_JOIN = 0.018;
-  const LEVEL_EDGES = [0, 0, 0, 0];
-  // 依世界座標排列北、東、南、西四條邊以及其外法線。
+  const SLOPE_HALF_WIDTH = 0.21;
+  const worldMeshes = new WeakMap();
+  // 依世界座標排列北、東、南、西四條邊。
   const SIDES = [
-    { dx: 0, dy: -1, a: 0, b: 1 },
-    { dx: 1, dy: 0, a: 1, b: 2 },
-    { dx: 0, dy: 1, a: 2, b: 3 },
-    { dx: -1, dy: 0, a: 3, b: 0 }
+    { dx: 0, dy: -1 },
+    { dx: 1, dy: 0 },
+    { dx: 0, dy: 1 },
+    { dx: -1, dy: 0 }
   ];
-  const CORNERS = [[0, 0], [1, 0], [1, 1], [0, 1]];
   const keyOf = (x, y) => `${x},${y}`;
   const clamp = (value, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, value));
   const smooth = value => { const t = clamp(value); return t * t * (3 - 2 * t); };
   const elevAt = (map, x, y) => map[y]?.[x]?.elev || 0;
 
-  function cliffHeight(map, x, y, side) {
-    return Math.max(0, elevAt(map, x, y) - elevAt(map, x + side.dx, y + side.dy));
+  // 每一側提供半個坡寬。兩端的高度曲線逐漸接平，格線位於坡中央。
+  function heightWeights(value) {
+    const cell = clamp(Math.floor(value + 0.5), 0, SIZE - 1);
+    const offset = value - cell;
+    const gap = 0.5 - Math.abs(offset);
+    if (gap >= SLOPE_HALF_WIDTH) return [cell, cell, 0];
+    const neighbor = cell + (offset < 0 ? -1 : 1);
+    const boardEdge = neighbor < 0 || neighbor >= SIZE;
+    const t = 1 - gap / SLOPE_HALF_WIDTH;
+    return [cell, neighbor, smooth(boardEdge ? t : t * 0.5)];
   }
 
-  function edgePoint([ax, ay], [bx, by], fraction) {
-    return [ax + (bx - ax) * fraction, ay + (by - ay) * fraction];
+  function heightFromWeights(map, [x, nx, tx], [y, ny, ty]) {
+    const near = elevAt(map, x, y) * (1 - tx) + elevAt(map, nx, y) * tx;
+    const far = elevAt(map, x, ny) * (1 - tx) + elevAt(map, nx, ny) * tx;
+    return near * (1 - ty) + far * ty;
   }
 
-  // 坡腳落在格邊，頂緣只沿落差邊內收。同高度相鄰格共用頂面。
-  // 使用相同投影輪廓繪製坡面與判定點格。
-  function projectHill(map, x, y, project) {
-    const elevation = elevAt(map, x, y);
-    const drops = SIDES.map(side => cliffHeight(map, x, y, side));
-    const insets = drops.map(drop => drop ? SLOPE_WIDTH : 0);
-    // 同一高度的邊緣少量交疊，避免透出抗鋸齒亮縫。
-    const [north, east, south, west] = insets.map(inset => inset || -PLATFORM_JOIN);
-    const corners = [[west, north], [1 - east, north], [1 - east, 1 - south], [west, 1 - south]];
-    const at = ([u, v], height) => project(x + u - 0.5, y + v - 0.5, height);
-    const edges = SIDES.map((side, i) => {
-      const a = corners[side.a];
-      const b = corners[side.b];
-      const drop = drops[i];
-      if (!drop) return { rim: [at(a, elevation), at(b, elevation)] };
+  function heightAt(map, x, y) {
+    return heightFromWeights(map, heightWeights(x), heightWeights(y));
+  }
 
-      const cutStart = drops[(i + 3) % 4] ? 0.12 : 0;
-      const cutEnd = drops[(i + 1) % 4] ? 0.12 : 0;
-      const irregularity = (x + y + i) % 2 === 0 ? 0.03 : -0.03;
-      const rim = [cutStart, 0.34, 0.67, 1 - cutEnd].map((fraction, index) => {
-        const [u, v] = edgePoint(a, b, fraction);
-        const offset = index === 1 ? irregularity : index === 2 ? -irregularity : 0;
-        return at([u - side.dx * offset, v - side.dy * offset], elevation);
-      });
-      const foot = [cutStart * 0.42, 1 - cutEnd * 0.42].map(fraction =>
-        at(edgePoint(CORNERS[side.a], CORNERS[side.b], fraction), elevation - drop));
-      return { rim, foot };
-    });
+  function cuts(hasStart, hasEnd) {
+    const half = SLOPE_HALF_WIDTH;
+    return [-0.5, ...(hasStart ? [-0.5 + half * 0.5, -0.5 + half] : []),
+      ...(hasEnd ? [0.5 - half, 0.5 - half * 0.5] : []), 0.5];
+  }
 
-    const slopes = [];
-    function addSlope(rim, foot, shade, textureSpan = 1) {
-      const polygon = [...rim, foot[1], foot[0]];
-      const area = polygon.reduce((sum, point, i) => {
-        const next = polygon[(i + 1) % polygon.length];
-        return sum + point.bx * next.by - point.by * next.bx;
-      }, 0);
-      if (area < -0.01) slopes.push({ polygon, rim, foot, shade, textureSpan });
-    }
-    for (const [i, edge] of edges.entries()) {
-      if (!edge.foot) continue;
-      const shade = i === 1 || i === 2;
-      addSlope(edge.rim, edge.foot, shade);
-      const next = edges[(i + 1) % 4];
-      if (next.foot) {
-        addSlope([edge.rim.at(-1), next.rim[0]], [edge.foot[1], next.foot[0]], shade, 0.14);
+  function meshFaces(rows, x, y) {
+    const width = rows[0].length - 1, height = rows.length - 1;
+    const painted = Array.from({ length: height }, () => Array(width).fill(false));
+    const faces = [];
+    const append = (a, b, c, d) => {
+      if (a.elev + b.elev + c.elev + d.elev > 0) faces.push({ points: [a, b, c, d], x, y });
+    };
+    for (let j = 0; j < height; j++) {
+      for (let i = 0; i < width; i++) {
+        if (painted[j][i]) continue;
+        const a = rows[j][i], b = rows[j][i + 1], c = rows[j + 1][i + 1], d = rows[j + 1][i];
+        if (Math.abs(a.elev + c.elev - b.elev - d.elev) >= 1e-7) {
+          append(a, b, c, d);
+          continue;
+        }
+        // 沿同一平面合併相鄰片面，使平頂與連續坡帶可用一次貼圖繪製。
+        const slopeX = (b.elev - a.elev) / (b.x - a.x);
+        const slopeY = (d.elev - a.elev) / (d.y - a.y);
+        const onPlane = point =>
+          Math.abs(point.elev - a.elev - slopeX * (point.x - a.x) - slopeY * (point.y - a.y)) < 1e-7;
+        let right = i + 1, bottom = j + 1;
+        while (right < width && !painted[j][right] && onPlane(rows[j][right + 1]) && onPlane(rows[j + 1][right + 1])) right++;
+        while (bottom < height) {
+          let fits = onPlane(rows[bottom + 1][right]);
+          for (let column = i; fits && column < right; column++) {
+            fits = !painted[bottom][column] && onPlane(rows[bottom + 1][column]);
+          }
+          if (!fits) break;
+          bottom++;
+        }
+        for (let row = j; row < bottom; row++) painted[row].fill(true, i, right);
+        append(a, rows[j][right], rows[bottom][right], rows[bottom][i]);
       }
     }
-    return { top: edges.flatMap(edge => edge.rim), slopes, insets };
+    return faces;
   }
 
-  function polygonContains(points, x, y) {
-    let inside = false;
-    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
-      const a = points[j];
-      const b = points[i];
-      if ((a.by > y) !== (b.by > y) && x < (b.bx - a.bx) * (y - a.by) / (b.by - a.by) + a.bx) inside = !inside;
+  function worldMesh(map) {
+    if (worldMeshes.has(map)) return worldMeshes.get(map);
+    const cells = map.flatMap((row, y) => row.map((_, x) => {
+      // 斜角也參與取樣，讓同一角上的四格共用高度。
+      const adjacent = [-1, 0, 1];
+      const differsX = dx => adjacent.some(dy => elevAt(map, x, y + dy) !== elevAt(map, x + dx, y + dy));
+      const differsY = dy => adjacent.some(dx => elevAt(map, x + dx, y) !== elevAt(map, x + dx, y + dy));
+      const xs = cuts(differsX(-1), differsX(1)).map(u => x + u);
+      const ys = cuts(differsY(-1), differsY(1)).map(v => y + v);
+      const rows = ys.map(v => xs.map(u => ({ x: u, y: v, elev: heightAt(map, u, v) })));
+      const faces = meshFaces(rows, x, y);
+      const edges = [
+        rows[0], rows.map(row => row.at(-1)), [...rows.at(-1)].reverse(),
+        rows.map(row => row[0]).reverse()
+      ];
+      return { faces, edges };
+    }));
+    worldMeshes.set(map, cells);
+    return cells;
+  }
+
+  function blendFaceEdges(points) {
+    // 紋理在相鄰片面微量重疊，遮住 Canvas 裁切反鋸齒造成的亮縫。
+    const normals = points.map((a, i) => {
+      const b = points[(i + 1) % points.length];
+      const dx = b.bx - a.bx, dy = b.by - a.by, length = Math.hypot(dx, dy) || 1;
+      return [dy / length, -dx / length];
+    });
+    return points.map((point, i) => {
+      const [ax, ay] = normals[(i + points.length - 1) % points.length];
+      const [bx, by] = normals[i];
+      const scale = Math.min(1.25, 0.6 / Math.max(0.08, 1 + ax * bx + ay * by));
+      return { bx: point.bx + (ax + bx) * scale, by: point.by + (ay + by) * scale };
+    });
+  }
+
+  function projectTerrain(map, project) {
+    const projected = point => ({ ...point, ...project(point.x, point.y, point.elev) });
+    return worldMesh(map).map((cell, index) => {
+      const faces = [];
+      const area = (a, b, c) => (b.bx - a.bx) * (c.by - a.by) - (b.by - a.by) * (c.bx - a.bx);
+      function append(face, points) {
+        const [a, b, c, d] = points;
+        const u = b.x - a.x, v = b.y - a.y;
+        const p = c.x - a.x, q = c.y - a.y;
+        const det = u * q - v * p;
+        const dx = b.bx - a.bx, dy = b.by - a.by;
+        const ex = c.bx - a.bx, ey = c.by - a.by;
+        let xx = (dx * q - ex * v) / det, xy = (ex * u - dx * p) / det;
+        let yx = (dy * q - ey * v) / det, yy = (ey * u - dy * p) / det;
+        let tx = a.bx - xx * (a.x + 0.5) - xy * (a.y + 0.5);
+        let ty = a.by - yx * (a.x + 0.5) - yy * (a.y + 0.5);
+        if (d) {
+          // 用角點的平均位置對齊貼圖，坡角的非平面四邊形仍只需畫一次。
+          xx = (b.bx - a.bx + c.bx - d.bx) / (2 * u);
+          xy = (d.bx - a.bx + c.bx - b.bx) / (2 * q);
+          yx = (b.by - a.by + c.by - d.by) / (2 * u);
+          yy = (d.by - a.by + c.by - b.by) / (2 * q);
+          tx = (a.bx + b.bx + c.bx + d.bx) * 0.25 - xx * ((a.x + c.x) * 0.5 + 0.5) - xy * ((a.y + c.y) * 0.5 + 0.5);
+          ty = (a.by + b.by + c.by + d.by) * 0.25 - yx * ((a.x + c.x) * 0.5 + 0.5) - yy * ((a.y + c.y) * 0.5 + 0.5);
+        }
+        const bx = points.map(point => point.bx), by = points.map(point => point.by);
+        faces.push({ ...face, points, padded: blendFaceEdges(points),
+          transform: [xx, yx, xy, yy, tx, ty],
+          left: Math.min(...bx), top: Math.min(...by), right: Math.max(...bx), bottom: Math.max(...by) });
+      }
+
+      for (const face of cell.faces) {
+        const points = face.points.map(projected);
+        const [a, b, c, d] = points;
+        const frontABC = area(a, b, c) > 1e-7;
+        const frontACD = area(a, c, d) > 1e-7;
+        if (frontABC && frontACD) append(face, points);
+        else if (frontABC) append(face, [a, b, c]);
+        else if (frontACD) append(face, [a, c, d]);
+      }
+      const edges = cell.edges.map(edge => edge.map(projected));
+      const x = index % SIZE, y = Math.floor(index / SIZE);
+      const center = project(x, y, 0);
+      // 共用的格線由較前方的一格繪製，避免被該格的地表蓋掉。
+      const gridEdges = edges.filter((_, i) => {
+        const { dx, dy } = SIDES[i];
+        if (!map[y + dy]?.[x + dx]) return true;
+        const neighbor = project(x + dx, y + dy, 0);
+        const delta = center.by - neighbor.by;
+        return Math.abs(delta) > 1e-8 ? delta > 0 : center.bx > neighbor.bx;
+      });
+      return { faces, edges, gridEdges };
+    });
+  }
+
+  function heightInTriangle(a, b, c, x, y) {
+    const dx = x - a.bx, dy = y - a.by;
+    const u = b.bx - a.bx, v = b.by - a.by;
+    const p = c.bx - a.bx, q = c.by - a.by;
+    const det = u * q - v * p;
+    if (Math.abs(det) < 1e-9) return -1;
+    const s = (dx * q - dy * p) / det, t = (u * dy - v * dx) / det;
+    if (s < -1e-7 || t < -1e-7 || s + t > 1 + 1e-7) return -1;
+    return a.elev + s * (b.elev - a.elev) + t * (c.elev - a.elev);
+  }
+
+  function pickTerrain(terrain, x, y) {
+    let hit = null;
+    let frontHeight = 1e-7;
+    for (const cell of terrain) {
+      for (const face of cell.faces) {
+        if (x < face.left || x > face.right || y < face.top || y > face.bottom) continue;
+        const [a, b, c, d] = face.points;
+        const h = Math.max(heightInTriangle(a, b, c, x, y),
+          d ? heightInTriangle(a, c, d, x, y) : -1);
+        // 同一像素重疊時，沿視線取較高、較近的表面。
+        if (h > frontHeight) {
+          frontHeight = h;
+          hit = { x: face.x, y: face.y };
+        }
+      }
     }
-    return inside;
-  }
-
-  function hillContains(hill, x, y) {
-    return polygonContains(hill.top, x, y) || hill.slopes.some(slope => polygonContains(slope.polygon, x, y));
+    return hit;
   }
 
   function tracePolygon(ctx, points) {
@@ -109,19 +221,6 @@
     const south = project(x, y + 1, elev);
     ctx.transform(east.bx - origin.bx, east.by - origin.by,
       south.bx - origin.bx, south.by - origin.by, origin.bx, origin.by);
-  }
-
-  function roundedRect(ctx, l, t, r, b, [nw, ne, se, sw]) {
-    ctx.moveTo(l + nw, t);
-    ctx.lineTo(r - ne, t);
-    ctx.quadraticCurveTo(r, t, r, t + ne);
-    ctx.lineTo(r, b - se);
-    ctx.quadraticCurveTo(r, b, r - se, b);
-    ctx.lineTo(l + sw, b);
-    ctx.quadraticCurveTo(l, b, l, b - sw);
-    ctx.lineTo(l, t + nw);
-    ctx.quadraticCurveTo(l, t, l + nw, t);
-    ctx.closePath();
   }
 
   // 視野與林緣只需檢查相鄰八格，柔化寬度遠小於一格。
@@ -169,8 +268,9 @@
     }
 
     const ground = newCanvas(1, 1);
-    const hillSurface = newCanvas(1, 1);
-    const scree = newCanvas(384, 144);
+    const reliefSurface = newCanvas(1, 1);
+    const rockSurface = newCanvas(1, 1);
+    const rockMask = newCanvas(MASK_SIZE, MASK_SIZE);
     const forestMask = newCanvas(MASK_SIZE, MASK_SIZE);
     const fogMask = newCanvas(MASK_SIZE, MASK_SIZE);
     const fogClouds = newCanvas(MASK_SIZE, MASK_SIZE);
@@ -186,9 +286,8 @@
     let fogMap;
     let fogView;
     let hasFog = false;
-    let hillSurfaceKey = '';
-    let screeSource;
-    let hillPixels = 96;
+    let reliefKey = '';
+    let reliefPixels = 96;
     let cloudAt = -Infinity;
     let cloudMode = '';
     let tacticsScene;
@@ -343,9 +442,9 @@
             // 世界座標的影子跟著台地旋轉，無須因鏡頭角度重建底圖。
             groundShadow(ctx, centerX + 0.30, centerY + 0.44, 0.92, 0.57, 0.72, 0.54);
             for (const [i, side] of SIDES.entries()) {
-              if (!cliffHeight(map, x, y, side)) continue;
-              const px = centerX + side.dx * 0.57 + side.dy * 0.22;
-              const py = centerY + side.dy * 0.57 + side.dx * 0.22;
+              if (elevAt(map, x + side.dx, y + side.dy)) continue;
+              const px = centerX + side.dx * 0.68 + side.dy * 0.22;
+              const py = centerY + side.dy * 0.68 + side.dx * 0.22;
               const rubble = assets('props/rubble.png');
               if (rubble) ctx.drawImage(rubble, px - 0.16, py - 0.10, 0.32, 0.20);
               else {
@@ -435,7 +534,8 @@
 
       const animated = frame.quality === 'high' && !frame.reducedMotion;
       const mode = `${animated}:${frame.assetVersion ?? 0}`;
-      if (cloudMode === mode && (!animated || nowMs - cloudAt < 80)) return;
+      // 轉動途中重用同一張雲紋，視野變動則在上方立即更新遮罩與雲紋。
+      if (cloudMode === mode && (!animated || frame.turning || nowMs - cloudAt < 80)) return;
       const ctx = fogClouds.getContext('2d');
       const cloud = texture('fog_cloud');
       cloudAt = nowMs;
@@ -506,29 +606,103 @@
       }
     }
 
-    function prepareHillSurface(frame) {
-      const key = `${frame.quality}:${frame.assetVersion ?? 0}:${fogBits}`;
-      if (hillSurfaceKey === key) return;
-      hillSurfaceKey = key;
-      hillPixels = frame.quality === 'high' ? 128 : 72;
-      const size = SIZE * hillPixels;
-      if (hillSurface.width !== size) {
-        hillSurface.width = size;
-        hillSurface.height = size;
+    function rebuildRockMask(map) {
+      const ctx = rockMask.getContext('2d');
+      const image = ctx.createImageData(MASK_SIZE, MASK_SIZE);
+      const weights = Array.from({ length: MASK_SIZE }, (_, i) => heightWeights((i + 0.5) / MASK_TILE - 0.5));
+      for (let y = 0; y < MASK_SIZE; y++) {
+        for (let x = 0; x < MASK_SIZE; x++) {
+          const elev = heightFromWeights(map, weights[x], weights[y]);
+          const cx = Math.floor(x / MASK_TILE), cy = Math.floor(y / MASK_TILE);
+          const u = x / MASK_TILE - cx, v = y / MASK_TILE - cy;
+          const grassX = 0.22 + 0.56 * tileHash(cx, cy, 195);
+          const grassY = 0.22 + 0.56 * tileHash(cx, cy, 196);
+          const grass = smooth((0.23 - Math.hypot(u - grassX, (v - grassY) * 1.15)) / 0.14);
+          const variation = Math.sin(x * 0.31 + y * 0.22) * 0.025 + Math.cos(x * 0.18 - y * 0.4) * 0.025;
+          const alpha = smooth((elev - (0.08 + variation)) / 0.76);
+          image.data[(y * MASK_SIZE + x) * 4 + 3] = alpha * (1 - grass * 0.90 * smooth((elev - 0.72) / 0.28)) * 255;
+        }
       }
-      const ctx = hillSurface.getContext('2d');
-      fillTexture(ctx, texture('hilltop'), size, hillPixels * 3.2);
-      // 把迷霧合成到連續凸台材質後才逐格裁切，避免半透明反鋸齒露出亮縫。
-      if (hasFog) ctx.drawImage(fogMask, 0, 0, size, size);
+      ctx.putImageData(image, 0, 0);
+    }
+
+    function rebuildRockSurface(map, pixels, size) {
+      rockSurface.width = rockSurface.height = size;
+      const ctx = rockSurface.getContext('2d');
+      fillTexture(ctx, texture('cliff_face'), size, pixels * 1.8);
+      ctx.fillStyle = 'rgba(89, 90, 83, 0.52)';
+      ctx.fillRect(0, 0, size, size);
+      ctx.save();
+      ctx.scale(pixels, pixels);
+      for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+          if (!map[y][x].elev) continue;
+          for (let i = 0; i < 34; i++) {
+            const u = x + tileHash(x, y, 1100 + i);
+            const v = y + tileHash(x, y, 1200 + i);
+            const radius = 0.023 + tileHash(x, y, 1300 + i) ** 2 * 0.077;
+            const angle = tileHash(x, y, 1400 + i) * Math.PI * 2;
+            ctx.save();
+            ctx.translate(u, v);
+            ctx.rotate(angle);
+            ctx.beginPath();
+            ctx.moveTo(-radius, radius * 0.22);
+            ctx.lineTo(-radius * 0.56, -radius * 0.54);
+            ctx.lineTo(radius * 0.48, -radius * 0.74);
+            ctx.lineTo(radius, -radius * 0.08);
+            ctx.lineTo(radius * 0.51, radius * 0.58);
+            ctx.closePath();
+            ctx.fillStyle = i % 3 === 0 ? '#5e6057' : '#747269';
+            ctx.fill();
+            ctx.beginPath();
+            ctx.moveTo(-radius * 0.56, -radius * 0.54);
+            ctx.lineTo(radius * 0.48, -radius * 0.74);
+            ctx.lineTo(radius * 0.52, -radius * 0.12);
+            ctx.lineTo(-radius * 0.63, radius * 0.06);
+            ctx.closePath();
+            ctx.fillStyle = i % 3 === 0 ? '#8f9389' : '#a6a494';
+            ctx.fill();
+            ctx.restore();
+          }
+        }
+      }
+      ctx.restore();
+      ctx.globalCompositeOperation = 'destination-in';
+      ctx.drawImage(rockMask, 0, 0, size, size);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    function prepareRelief(frame) {
+      const key = `${frame.quality}:${frame.assetVersion ?? 0}:${fogBits}:${hasFog ? cloudAt : ''}`;
+      if (reliefKey === key) return;
+      reliefKey = key;
+      reliefPixels = frame.quality === 'high' ? 128 : 72;
+      const size = SIZE * reliefPixels;
+      if (reliefSurface.width !== size) reliefSurface.width = reliefSurface.height = size;
+      const ctx = reliefSurface.getContext('2d');
+      ctx.drawImage(ground, 0, 0, size, size);
+      ctx.drawImage(rockSurface, 0, 0, size, size);
+      if (hasFog) {
+        ctx.drawImage(fogMask, 0, 0, size, size);
+        ctx.globalAlpha = 0.55;
+        ctx.drawImage(fogClouds, 0, 0, size, size);
+        ctx.globalAlpha = 1;
+      }
     }
 
     function drawGround(ctx, scene, frame) {
       const map = scene.board.map;
       if (mapForGround !== map || groundQuality !== frame.quality || groundVersion !== frame.assetVersion) {
+        if (mapForGround !== map) rebuildRockMask(map);
         rebuildGround(map, frame.quality, frame.assetVersion);
+        const pixels = frame.quality === 'high' ? 128 : 72;
+        rebuildRockSurface(map, pixels, SIZE * pixels);
+        reliefKey = '';
       }
       prepareFog(scene, frame);
-      prepareHillSurface(frame);
+      prepareRelief(frame);
+      frame.reliefPattern = ctx.createPattern(reliefSurface, 'no-repeat');
+      frame.reliefMatrix = new DOMMatrix();
       prepareTactics(scene);
       const project = frame.projectFloat;
       ctx.save();
@@ -546,15 +720,15 @@
         ctx.strokeStyle = 'rgba(26, 41, 22, 0.39)';
         ctx.lineWidth = 0.72 / Math.max(1, frame.zoom || 1) ** 0.3;
         ctx.beginPath();
-        for (let coordinate = -0.5; coordinate <= SIZE - 0.5; coordinate++) {
-          const a = project(coordinate, -0.5, 0);
-          const b = project(coordinate, SIZE - 0.5, 0);
-          const c = project(-0.5, coordinate, 0);
-          const d = project(SIZE - 0.5, coordinate, 0);
-          ctx.moveTo(a.bx, a.by);
-          ctx.lineTo(b.bx, b.by);
-          ctx.moveTo(c.bx, c.by);
-          ctx.lineTo(d.bx, d.by);
+        for (const cell of frame.terrain) {
+          for (const edge of cell.gridEdges) {
+            for (let i = 1; i < edge.length; i++) {
+              const a = edge[i - 1], b = edge[i];
+              if (a.elev || b.elev) continue;
+              ctx.moveTo(a.bx, a.by);
+              ctx.lineTo(b.bx, b.by);
+            }
+          }
         }
         ctx.stroke();
         ctx.restore();
@@ -562,106 +736,55 @@
       return true;
     }
 
-    function screeTexture() {
-      const cliff = texture('cliff_face');
-      if (screeSource === cliff) return scree;
-      screeSource = cliff;
-      const ctx = scree.getContext('2d');
-      const { width, height } = scree;
-      const moss = Math.floor(cliff.height * 0.14);
-      ctx.drawImage(cliff, 0, moss, cliff.width, cliff.height - moss, 0, 0, width, height);
-
-      // 碎片大多落在坡的下半，交錯亮面與陰影保留粗糙的岩面層次。
-      for (let i = 0; i < 180; i++) {
-        const x = tileHash(i, 0, 242) * width;
-        const y = Math.sqrt(tileHash(i, 0, 243)) * height;
-        const radius = 2 + tileHash(i, 0, 244) ** 2 * 13;
-        const gray = tileHash(i, 0, 245) * 25;
-        ctx.beginPath();
-        ctx.moveTo(x - radius, y + radius * 0.3);
-        ctx.lineTo(x - radius * 0.46, y - radius * 0.55);
-        ctx.lineTo(x + radius * 0.55, y - radius * 0.61);
-        ctx.lineTo(x + radius, y + radius * 0.14);
-        ctx.lineTo(x + radius * 0.31, y + radius * 0.64);
-        ctx.closePath();
-        ctx.fillStyle = `rgb(${101 + gray} ${93 + gray} ${74 + gray} / 0.82)`;
-        ctx.fill();
-        ctx.beginPath();
-        ctx.moveTo(x - radius * 0.46, y - radius * 0.55);
-        ctx.lineTo(x + radius * 0.55, y - radius * 0.61);
-        ctx.lineTo(x + radius * 0.64, y);
-        ctx.lineTo(x - radius * 0.63, y + radius * 0.02);
-        ctx.closePath();
-        ctx.fillStyle = `rgb(${151 + gray} ${141 + gray} ${114 + gray} / 0.75)`;
-        ctx.fill();
-      }
-      return scree;
-    }
-
-    function drawSlope(ctx, { polygon, rim, foot, shade, textureSpan }, fogged) {
-      const [a, b] = foot;
-      const topA = rim[0];
-      const topB = rim.at(-1);
-      const dx = (a.bx + b.bx - topA.bx - topB.bx) * 0.5;
-      const dy = (a.by + b.by - topA.by - topB.by) * 0.5;
+    function drawRelief(ctx, frame, tile) {
+      if (!tile.surface.faces.length) return;
+      const { reliefPattern, reliefMatrix } = frame;
       ctx.save();
-      tracePolygon(ctx, polygon);
-      ctx.fillStyle = '#897857';
-      ctx.fill();
-      ctx.clip();
-      ctx.transform(b.bx - a.bx, b.by - a.by, dx, dy, a.bx - dx, a.by - dy);
-      const texture = screeTexture();
-      const strip = texture.width * textureSpan;
-      ctx.drawImage(texture, (texture.width - strip) * 0.5, 0, strip, texture.height, -0.15, -0.22, 1.30, 1.24);
-
-      const tint = ctx.createLinearGradient(0, 0, 0, 1);
-      tint.addColorStop(0, shade ? '#272b2560' : '#eed09628');
-      tint.addColorStop(0.76, shade ? '#25281c36' : '#78714910');
-      tint.addColorStop(1, '#656b3d90');
-      ctx.fillStyle = tint;
-      ctx.fillRect(-0.15, -0.22, 1.30, 1.24);
-      if (fogged) {
-        ctx.fillStyle = 'rgba(23, 43, 65, 0.52)';
-        ctx.fillRect(-0.15, -0.22, 1.30, 1.24);
+      for (const { padded, transform } of tile.surface.faces) {
+        const [xx, yx, xy, yy, tx, ty] = transform;
+        reliefMatrix.a = xx / reliefPixels;
+        reliefMatrix.b = yx / reliefPixels;
+        reliefMatrix.c = xy / reliefPixels;
+        reliefMatrix.d = yy / reliefPixels;
+        reliefMatrix.e = tx;
+        reliefMatrix.f = ty;
+        reliefPattern.setTransform(reliefMatrix);
+        tracePolygon(ctx, padded);
+        ctx.fillStyle = reliefPattern;
+        ctx.fill();
       }
       ctx.restore();
-    }
-
-    function drawHill(ctx, scene, frame, tile) {
-      const { x, y, cell, hill } = tile;
-      for (const slope of hill.slopes) drawSlope(ctx, slope, !scene.visibleTiles[y][x]);
-
+      if (frame.gridVisible === false) return;
       ctx.save();
-      tracePolygon(ctx, hill.top);
-      ctx.clip();
-      transformSurface(ctx, frame.projectFloat, x - 0.5, y - 0.5, cell.elev);
-      const l = Math.max(0, x - 0.04);
-      const t = Math.max(0, y - 0.04);
-      const r = Math.min(SIZE, x + 1.04);
-      const b = Math.min(SIZE, y + 1.04);
-      ctx.drawImage(hillSurface, l * hillPixels, t * hillPixels, (r - l) * hillPixels, (b - t) * hillPixels,
-        l - x, t - y, r - l, b - t);
+      ctx.strokeStyle = 'rgba(26, 36, 25, 0.3)';
+      ctx.lineWidth = 0.72 / Math.max(1, frame.zoom || 1) ** 0.3;
+      ctx.beginPath();
+      for (const edge of tile.surface.gridEdges) {
+        for (let i = 1; i < edge.length; i++) {
+          const a = edge[i - 1], b = edge[i];
+          if (!a.elev && !b.elev) continue;
+          ctx.moveTo(a.bx, a.by);
+          ctx.lineTo(b.bx, b.by);
+        }
+      }
+      ctx.stroke();
       ctx.restore();
     }
 
     function drawFog(ctx, scene, frame, tile) {
       if (scene.showAll) return;
-      const { x, y, cell } = tile;
+      const { x, y, bx, by } = tile;
       const revealedAt = reveals.get(y * SIZE + x);
       if (revealedAt === undefined || frame.quality !== 'high' || frame.reducedMotion) return;
       ctx.save();
-      if (tile.hill) {
-        tracePolygon(ctx, tile.hill.top);
-        ctx.clip();
-      }
-      transformSurface(ctx, frame.projectFloat, x - 0.5, y - 0.5, cell.elev || 0);
-      const decay = 1 - clamp((frame.nowMs - revealedAt) / 300);
-      ctx.globalAlpha *= decay * 0.19;
-      const mist = ctx.createLinearGradient(0, 0, 0.63, 0.78);
+      tracePolygon(ctx, tile.surface.edges.flat());
+      ctx.globalAlpha *= (1 - clamp((frame.nowMs - revealedAt) / 300)) * 0.19;
+      const mist = ctx.createLinearGradient(bx - frame.metrics.tw * 0.3, by - frame.metrics.th * 0.3,
+        bx + frame.metrics.tw * 0.3, by + frame.metrics.th * 0.3);
       mist.addColorStop(0, '#bbd3edca');
       mist.addColorStop(1, '#bbd3ed00');
       ctx.fillStyle = mist;
-      ctx.fillRect(0, 0, 1, 1);
+      ctx.fill();
       ctx.restore();
     }
 
@@ -716,7 +839,7 @@
       if (!points.length) return;
       const placed = [];
       for (const tree of points) {
-        const p = frame.projectFloat(tree.px, tree.py, 0);
+        const p = frame.projectFloat(tree.px, tree.py, heightAt(scene.board.map, tree.px, tree.py));
         if ((p.by > by) !== (layer === 'front')) continue;
         placed.push({ tree, p });
       }
@@ -762,46 +885,53 @@
     }
 
     function drawTactics(ctx, scene, frame, tile) {
-      const { x, y, cell } = tile;
+      const { x, y } = tile;
       const regions = tacticsByTile.get(keyOf(x, y));
       if (!regions) return;
-      const elev = cell.elev || 0;
-      const [top, right, bottom, left] = tile.hill?.insets ?? LEVEL_EDGES;
       for (const region of regions) {
         const [north, east, south, west] = region.boundary;
-        const l = left + (west ? 0.06 : 0);
-        const t = top + (north ? 0.06 : 0);
-        const r = 1 - right - (east ? 0.06 : 0);
-        const b = 1 - bottom - (south ? 0.06 : 0);
+        const l = west ? 0.06 : 0;
+        const t = north ? 0.06 : 0;
+        const r = east ? 0.94 : 1;
+        const b = south ? 0.94 : 1;
         const radius = 0.11;
         const corners = [north && west, north && east, south && east, south && west].map(exposed => exposed ? radius : 0);
-        const project = (dx, dy) => frame.projectFloat(x + dx - 0.5, y + dy - 0.5, elev);
-        ctx.save();
-        ctx.save();
-        transformSurface(ctx, frame.projectFloat, x - 0.5, y - 0.5, elev);
-        ctx.beginPath();
-        roundedRect(ctx, l, t, r, b, corners);
-        ctx.fillStyle = region.fill;
-        ctx.fill();
-        ctx.restore();
-
-        // 只畫聯集的外露邊，同高度共邊的格子不再各自描框。
+        const project = (dx, dy) => frame.projectFloat(x + dx - 0.5, y + dy - 0.5,
+          heightAt(scene.board.map, x + dx - 0.5, y + dy - 0.5));
         const starts = [[l + corners[0], t], [r, t + corners[1]], [r - corners[2], b], [l, b - corners[3]]];
         const ends = [[r - corners[1], t], [r, b - corners[2]], [l + corners[3], b], [l, t + corners[0]]];
         const bounds = [[l, t], [r, t], [r, b], [l, b]];
-        ctx.beginPath();
-        for (let i = 0; i < 4; i++) {
-          if (!region.boundary[i]) continue;
-          const a = project(...starts[i]);
-          const b = project(...ends[i]);
-          ctx.moveTo(a.bx, a.by);
-          ctx.lineTo(b.bx, b.by);
-          const j = (i + 1) % 4;
-          if (corners[j]) {
-            const control = project(...bounds[j]);
-            const end = project(...starts[j]);
-            ctx.quadraticCurveTo(control.bx, control.by, end.bx, end.by);
+        const sections = starts.map(([ax, ay], i) => {
+          const [bx, by] = ends[i];
+          const points = [];
+          const steps = tile.surface.faces.length ? 8 : 1;
+          for (let j = 0; j <= steps; j++) {
+            points.push(project(ax + (bx - ax) * j / steps, ay + (by - ay) * j / steps));
           }
+          const next = (i + 1) % 4;
+          if (corners[next]) {
+            const [cx, cy] = bounds[next];
+            const [dx, dy] = starts[next];
+            for (const f of [1 / 3, 2 / 3, 1]) {
+              const k = 1 - f;
+              points.push(project(k * k * bx + 2 * f * k * cx + f * f * dx,
+                k * k * by + 2 * f * k * cy + f * f * dy));
+            }
+          }
+          return points;
+        });
+        ctx.save();
+        tracePolygon(ctx, sections.flat());
+        ctx.fillStyle = region.fill;
+        ctx.fill();
+
+        // 地面提示沿坡面取樣，同高度的相鄰格共用區域輪廓。
+        ctx.beginPath();
+        for (let i = 0; i < sections.length; i++) {
+          if (!region.boundary[i]) continue;
+          const points = sections[i];
+          ctx.moveTo(points[0].bx, points[0].by);
+          for (let j = 1; j < points.length; j++) ctx.lineTo(points[j].bx, points[j].by);
         }
         ctx.lineJoin = 'round';
         ctx.lineCap = 'round';
@@ -829,11 +959,11 @@
     }
 
     return {
-      drawGround, drawHill, drawFog, drawForest, drawUpperFog, drawTactics,
+      drawGround, drawRelief, drawFog, drawForest, drawUpperFog, drawTactics,
       hasActiveAnimation: nowMs => Array.from(reveals.values()).some(start => nowMs - start < 300),
-      invalidateAssets() { groundVersion = Symbol(); hillSurfaceKey = ''; cloudMode = ''; shadedTrees.clear(); }
+      invalidateAssets() { groundVersion = Symbol(); reliefKey = ''; cloudMode = ''; shadedTrees.clear(); }
     };
   }
 
-  return { create, projectHill, hillContains };
+  return { create, projectTerrain, pickTerrain, heightAt };
 });

@@ -1786,7 +1786,7 @@
       hdQualityNoticeShown = true;
     }
     document.getElementById('hdQualityBtn').textContent = quality === 'high' ? '畫質：高' : '畫質：標準';
-    const interactionHint = window.matchMedia('(pointer: coarse)').matches ? '雙指縮放 · 單指平移' : '滾輪縮放 · 拖曳平移';
+    const interactionHint = window.matchMedia('(pointer: coarse)').matches ? '雙指旋轉與縮放 · 單指平移' : '右鍵旋轉 · 左鍵平移 · 滾輪縮放';
     document.getElementById('hdControlHint').textContent = hdQualityNotice ? '已自動降為標準畫質' : interactionHint;
   }
 

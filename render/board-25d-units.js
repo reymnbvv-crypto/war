@@ -267,7 +267,7 @@
       const item = {
         unit, x, y, s, body, opts, rx: 13.5 * s, ry: 6.5 * s,
         palette: getFactionPalette(unit.faction, Boolean(opts.isGhost)),
-        dir: facingSignFor(unit.faction, opts.rot || 0),
+        dir: facingSignFor(unit.faction, opts.theta || 0),
         image: getAsset(`units/${unit.faction}_${unit.type}.png`) || null
       };
       c.save();
@@ -281,7 +281,8 @@
       if (opts.isCasualty) return;
       if (opts.recordHitBox && !opts.isGhost && hitBoxes) {
         hitBoxes.push({
-          x: unit.x, y: unit.y,
+          id: unit.id, x: unit.x, y: unit.y,
+          baseX: x, baseY: y, baseRx: item.rx, baseRy: item.ry,
           left: x - 14.5 * s, right: x + 14.5 * s,
           top: y - Math.min(27, profile.height) * s, bottom: y + 7 * s
         });

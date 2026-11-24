@@ -8,7 +8,7 @@
   /* =========================================================
    * 迷霧陣線（Tactical Fog Chess）2.5D 高清奇幻微縮沙盤渲染器
    * 零外部套件、純原生 HTML5 Canvas 2D、支援 HiDPI、
-   * 4 向 90° 旋轉、游標中心縮放、6px 防誤觸平移、
+   * 360° 水平旋轉、游標中心縮放、6px 防誤觸平移、
    * 逆畫家序精確解析點格與嚴格迷霧零洩密特效。
    * ========================================================= */
 
@@ -32,27 +32,13 @@
     return (n >>> 0) / 4294967296;
   }
 
-  function toRotated(x, y, rot) {
-    if (rot === 0) return { rx: x, ry: y };
-    if (rot === 1) return { rx: BOARD_SIZE - 1 - y, ry: x };
-    if (rot === 2) return { rx: BOARD_SIZE - 1 - x, ry: BOARD_SIZE - 1 - y };
-    return { rx: y, ry: BOARD_SIZE - 1 - x };
-  }
+  const CENTER = (BOARD_SIZE - 1) * 0.5;
+  const QUARTER_TURN = Math.PI * 0.5;
+  const normalizeAngle = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
 
-  function fromRotated(rx, ry, rot) {
-    if (rot === 0) return { x: rx, y: ry };
-    if (rot === 1) return { x: ry, y: BOARD_SIZE - 1 - rx };
-    if (rot === 2) return { x: BOARD_SIZE - 1 - rx, y: BOARD_SIZE - 1 - ry };
-    return { x: BOARD_SIZE - 1 - ry, y: rx };
-  }
-
-  function facingSignFor(faction, rot) {
-    // 藍方預設朝 y 減小方向前進，紅方朝 y 增大方向前進
-    const dy = faction === 'blue' ? -1 : 1;
-    const p0 = toRotated(5, 5, rot);
-    const p1 = toRotated(5, 5 + dy, rot);
-    const dxIso = (p1.rx - p1.ry) - (p0.rx - p0.ry);
-    return dxIso >= 0 ? 1 : -1;
+  function facingSignFor(faction, theta) {
+    const x = Math.sin(theta) + Math.cos(theta);
+    return (faction === 'blue' ? x : -x) >= 0 ? 1 : -1;
   }
 
   function drawRoundedRectPath(ctx, x, y, w, h, r) {
@@ -101,10 +87,11 @@
     let gridVisible = true;
     let backgroundCache = null;
     let plinthCache = null;
+    let terrainCache = null;
     let cameraLayer = null;
     let cameraLayerValid = false;
     let orderedTiles = null;
-    let orderedRotation = null;
+    let orderedAngle = null;
     let assetVersion = 0;
     let lastPointer = null;
 
@@ -123,10 +110,11 @@
       drawUnitSculpt, drawRoundedRectPath, facingSignFor
     });
 
-    // 鏡頭狀態（rot: 0..3，zoom: 0.85..2.4，panX/panY: CSS px）
+    // 方位角用弧度表示，平移以 CSS 像素為單位。
     const camera = {
-      rot: 0,
       theta: 0,
+      cos: 1,
+      sin: 0,
       rotation: null,
       zoom: 1,
       panX: 0,
@@ -165,14 +153,33 @@
       return { tw, th, elevH, baseDepth, originX, originY };
     }
 
+    function setAngle(theta) {
+      camera.theta = normalizeAngle(theta);
+      camera.cos = Math.cos(camera.theta);
+      camera.sin = Math.sin(camera.theta);
+      cameraLayerValid = false;
+      unitHitBoxes = [];
+    }
+
+    function isTurning() {
+      return Boolean(camera.rotation || (dragState?.button === 2 && dragState.moved) || pinchState?.turned);
+    }
+
     function rotatedPoint(x, y) {
-      if (!camera.rotation) return toRotated(x, y, camera.rot);
-      const center = (BOARD_SIZE - 1) * 0.5;
-      const cos = Math.cos(camera.theta);
-      const sin = Math.sin(camera.theta);
       return {
-        rx: center + (x - center) * cos - (y - center) * sin,
-        ry: center + (x - center) * sin + (y - center) * cos
+        rx: CENTER + (x - CENTER) * camera.cos - (y - CENTER) * camera.sin,
+        ry: CENTER + (x - CENTER) * camera.sin + (y - CENTER) * camera.cos
+      };
+    }
+
+    function groundPoint(bx, by, metrics) {
+      const u = (bx - metrics.originX) / metrics.tw;
+      const v = (by - metrics.originY) / metrics.th;
+      const rx = v + u - CENTER;
+      const ry = v - u - CENTER;
+      return {
+        x: CENTER + rx * camera.cos + ry * camera.sin,
+        y: CENTER - rx * camera.sin + ry * camera.cos
       };
     }
 
@@ -225,11 +232,11 @@
       if (typeof callbacks.onCameraChange === 'function') {
         callbacks.onCameraChange({
           zoom: camera.zoom,
-          rot: camera.rot,
+          theta: camera.theta,
           panX: camera.panX,
           panY: camera.panY,
           isDragging,
-          isRotating: Boolean(camera.rotation)
+          isRotating: isTurning()
         });
       }
     }
@@ -248,6 +255,7 @@
       dpr = nextDpr;
       backgroundCache = null;
       plinthCache = null;
+      terrainCache = null;
       cameraLayer = null;
       cameraLayerValid = false;
       canvas.width = Math.round(width * dpr);
@@ -258,42 +266,28 @@
     }
 
     /* =========================================================
-     * 精確逆畫家序解析命中檢測（零反鋸齒縫隙、零 GPU 回讀延遲、
-     * 支援任意縮放／平移／4 向旋轉與高地海拔立體遮擋）
+     * 解析地表命中檢測，支援任意角度、縮放與平移。
      * ========================================================= */
-    function hitTestTileAnalytic(bx, by, metrics) {
-      const { tw, th, elevH } = metrics;
-      const halfW = tw * 0.5;
-      const halfH = th * 0.5;
+    function getTerrain(metrics) {
       const map = scene.board.map;
-      const project = (x, y, elev) => projectBase(x, y, elev, metrics);
-
-      // 由最前景往最背景逐格檢測：先命中的即為玩家眼前最靠前的表面（含高地頂面與碎石坡）
-      for (let sum = (BOARD_SIZE - 1) * 2; sum >= 0; sum--) {
-        for (let rx = BOARD_SIZE - 1; rx >= 0; rx--) {
-          const ry = sum - rx;
-          if (ry < 0 || ry >= BOARD_SIZE) continue;
-          const { x, y } = fromRotated(rx, ry, camera.rot);
-          const elev = map[y][x].elev || 0;
-          const cx = metrics.originX + (rx - ry) * halfW;
-          const cy = metrics.originY + (rx + ry) * halfH - elev * elevH;
-
-          const dx = Math.abs(bx - cx);
-          if (dx > halfW) continue;
-          if (elev) {
-            if (by < cy - halfH || by > cy + halfH + elev * elevH) continue;
-            const hill = terrainModule.projectHill(map, x, y, project);
-            if (terrainModule.hillContains(hill, bx, by)) return { x, y };
-          } else if (dx / halfW + Math.abs(by - cy) / halfH <= 1.0005) {
-            return { x, y };
-          }
-        }
+      if (terrainCache?.map !== map || terrainCache.theta !== camera.theta) {
+        const project = (x, y, elev) => projectBase(x, y, elev, metrics);
+        terrainCache = { map, theta: camera.theta, tiles: terrainModule.projectTerrain(map, project) };
       }
-      return null;
+      return terrainCache.tiles;
+    }
+
+    function hitTestTileAnalytic(bx, by, metrics) {
+      const relief = terrainModule.pickTerrain(getTerrain(metrics), bx, by);
+      if (relief) return relief;
+      const point = groundPoint(bx, by, metrics);
+      const x = Math.floor(point.x + 0.5);
+      const y = Math.floor(point.y + 0.5);
+      return x >= 0 && y >= 0 && x < BOARD_SIZE && y < BOARD_SIZE ? { x, y } : null;
     }
 
     function pickTileAtClient(clientX, clientY) {
-      if (!scene || !scene.board || camera.rotation) return null;
+      if (!scene || !scene.board || isTurning()) return null;
       const rect = canvas.getBoundingClientRect();
       const sx = clientX - rect.left;
       const sy = clientY - rect.top;
@@ -301,14 +295,22 @@
 
       const { bx, by } = screenToBase(sx, sy);
 
-      // 1. 優先檢查可見棋子下半主體（由最前景往後檢查），方便直接點選立體棋身
+      // 任意角度下棋子可能排成一直線，先比靠近點擊處的底座，再比前景棋身。
+      let baseHit = null;
+      let baseDistance = 0.64;
+      let bodyHit = null;
       for (let i = unitHitBoxes.length - 1; i >= 0; i--) {
         const hb = unitHitBoxes[i];
-        if (!scene.visibleUnitsByKey.has(keyOf(hb.x, hb.y))) continue;
-        if (bx >= hb.left && bx <= hb.right && by >= hb.top && by <= hb.bottom) {
-          return { x: hb.x, y: hb.y };
+        if (scene.visibleUnitsByKey.get(keyOf(hb.x, hb.y))?.id !== hb.id) continue;
+        const distance = ((bx - hb.baseX) / hb.baseRx) ** 2 + ((by - hb.baseY) / hb.baseRy) ** 2;
+        if (distance < baseDistance) {
+          baseDistance = distance;
+          baseHit = hb;
         }
+        if (!bodyHit && bx >= hb.left && bx <= hb.right && by >= hb.top && by <= hb.bottom) bodyHit = hb;
       }
+      const hit = baseHit || bodyHit;
+      if (hit) return { x: hit.x, y: hit.y };
 
       // 2. 逆畫家序精確解析命中檢測
       return hitTestTileAnalytic(bx, by, getMetrics());
@@ -317,129 +319,21 @@
     /* =========================================================
      * 奇幻自然地景繪製（平地草甸、層岩高地、蔥鬱松林、台座與座標）
      * ========================================================= */
-    function drawDiamondPath(c, cx, cy, halfW, halfH) {
-      c.beginPath();
-      c.moveTo(cx, cy - halfH);
-      c.lineTo(cx + halfW, cy);
-      c.lineTo(cx, cy + halfH);
-      c.lineTo(cx - halfW, cy);
-      c.closePath();
-    }
-
-    function drawDioramaPlinth(c, metrics) {
-      const { tw, th, baseDepth, originX, originY } = metrics;
-      const halfW = tw * 0.5;
-      const halfH = th * 0.5;
-
-      // 四角點（最遠、最右、最近、最左）
-      const topX = originX;
-      const topY = originY - halfH;
-      const rightX = originX + BOARD_SIZE * halfW;
-      const rightY = originY + (BOARD_SIZE - 1) * halfH;
-      const bottomX = originX;
-      const bottomY = originY + (BOARD_SIZE * 2 - 1) * halfH;
-      const leftX = originX - BOARD_SIZE * halfW;
-      const leftY = originY + (BOARD_SIZE - 1) * halfH;
-
-      // 沙盤底座落地柔影
-      c.save();
-      c.fillStyle = 'rgba(2, 6, 16, 0.62)';
-      c.beginPath();
-      c.moveTo(topX, topY + baseDepth + th * 0.35);
-      c.lineTo(rightX + tw * 0.16, rightY + baseDepth + th * 0.42);
-      c.lineTo(bottomX, bottomY + baseDepth + th * 0.65);
-      c.lineTo(leftX - tw * 0.16, leftY + baseDepth + th * 0.42);
-      c.closePath();
-      c.fill();
-      c.restore();
-
-      const plinthH = baseDepth * 1.15;
-      // 左前石土斷面（受光面）
-      const leftGrad = c.createLinearGradient(leftX, leftY, leftX, leftY + plinthH);
-      leftGrad.addColorStop(0, '#5a4a3a');
-      leftGrad.addColorStop(0.28, '#46382c');
-      leftGrad.addColorStop(1, '#261f1a');
-      c.fillStyle = leftGrad;
-      c.beginPath();
-      c.moveTo(leftX, leftY);
-      c.lineTo(bottomX, bottomY);
-      c.lineTo(bottomX, bottomY + plinthH);
-      c.lineTo(leftX, leftY + plinthH);
-      c.closePath();
-      c.fill();
-
-      // 右前石土斷面（背光面）
-      const rightGrad = c.createLinearGradient(rightX, rightY, rightX, rightY + plinthH);
-      rightGrad.addColorStop(0, '#3e3329');
-      rightGrad.addColorStop(0.3, '#2d251e');
-      rightGrad.addColorStop(1, '#191411');
-      c.fillStyle = rightGrad;
-      c.beginPath();
-      c.moveTo(bottomX, bottomY);
-      c.lineTo(rightX, rightY);
-      c.lineTo(rightX, rightY + plinthH);
-      c.lineTo(bottomX, bottomY + plinthH);
-      c.closePath();
-      c.fill();
-
-      // 台座木石邊框收邊亮線
-      c.strokeStyle = 'rgba(226, 203, 164, 0.22)';
-      c.lineWidth = 1.1;
-      c.beginPath();
-      c.moveTo(leftX, leftY + plinthH * 0.22);
-      c.lineTo(bottomX, bottomY + plinthH * 0.22);
-      c.lineTo(rightX, rightY + plinthH * 0.22);
-      c.stroke();
-
-      // 沿兩條前景邊緣繪製準確對應旋轉方向的座標刻度（0–9）
-      const fontSize = clamp(tw * 0.175, 8.5, 13);
-      c.font = `800 ${fontSize}px system-ui, "PingFang TC", sans-serif`;
-      c.textAlign = 'center';
-      c.textBaseline = 'middle';
-
-      const bottomLeftAxis = (camera.rot === 0 || camera.rot === 2) ? 'X' : 'Y';
-      const bottomRightAxis = (camera.rot === 0 || camera.rot === 2) ? 'Y' : 'X';
-
-      for (let i = 0; i < BOARD_SIZE; i++) {
-        // 左前緣：ry = 9, rx = i（置中於該格左前斜邊中點）
-        const blCell = fromRotated(i, BOARD_SIZE - 1, camera.rot);
-        const blVal = bottomLeftAxis === 'X' ? blCell.x : blCell.y;
-        const blCx = originX + (i - (BOARD_SIZE - 1)) * halfW - halfW * 0.50;
-        const blCy = originY + (i + (BOARD_SIZE - 1)) * halfH + halfH * 0.50 + plinthH * 0.56;
-        c.fillStyle = 'rgba(232, 220, 196, 0.86)';
-        c.fillText(String(blVal), blCx, blCy);
-
-        // 右前緣：rx = 9, ry = i（置中於該格右前斜邊中點）
-        const brCell = fromRotated(BOARD_SIZE - 1, i, camera.rot);
-        const brVal = bottomRightAxis === 'X' ? brCell.x : brCell.y;
-        const brCx = originX + ((BOARD_SIZE - 1) - i) * halfW + halfW * 0.50;
-        const brCy = originY + ((BOARD_SIZE - 1) + i) * halfH + halfH * 0.50 + plinthH * 0.56;
-        c.fillStyle = 'rgba(202, 192, 172, 0.78)';
-        c.fillText(String(brVal), brCx, brCy);
-      }
-
-      // 軸名角標（X / Y）
-      c.font = `900 ${Math.max(9, fontSize * 0.92)}px system-ui, sans-serif`;
-      c.fillStyle = '#fbbf24';
-      c.fillText(bottomLeftAxis, leftX - tw * 0.16, leftY + plinthH * 0.65);
-      c.fillText(bottomRightAxis, rightX + tw * 0.16, rightY + plinthH * 0.65);
-    }
-
     /* =========================================================
      * 戰術高亮疊層（ZoC、上回合軌跡、可達格、衝鋒格、可攻格、回放標記）
      * ========================================================= */
-    function drawTileMarkPath(c, tile, metrics, scale) {
-      const { bx, by, hill } = tile;
-      if (!hill) {
-        drawDiamondPath(c, bx, by, metrics.tw * 0.5 * scale, metrics.th * 0.5 * scale);
-        return;
-      }
+    function drawTileMarkPath(c, tile, scale) {
+      const { bx, by, surface } = tile;
       c.beginPath();
-      for (const [i, point] of hill.top.entries()) {
-        const x = lerp(bx, point.bx, scale);
-        const y = lerp(by, point.by, scale);
-        if (i === 0) c.moveTo(x, y);
-        else c.lineTo(x, y);
+      let first = true;
+      for (const edge of surface.edges) {
+        for (const point of edge) {
+          const x = lerp(bx, point.bx, scale);
+          const y = lerp(by, point.by, scale);
+          if (first) c.moveTo(x, y);
+          else c.lineTo(x, y);
+          first = false;
+        }
       }
       c.closePath();
     }
@@ -453,14 +347,14 @@
 
       // 2. 上回合 AI 可見軌跡／攻擊高亮
       if (flags.enemyAttack) {
-        drawTileMarkPath(c, tile, metrics, 0.92);
+        drawTileMarkPath(c, tile, 0.92);
         c.fillStyle = 'rgba(244, 63, 94, 0.28)';
         c.fill();
         c.strokeStyle = 'rgba(244, 63, 94, 0.92)';
         c.lineWidth = 2;
         c.stroke();
       } else if (flags.enemyTrail) {
-        drawTileMarkPath(c, tile, metrics, 0.88);
+        drawTileMarkPath(c, tile, 0.88);
         c.fillStyle = `rgba(249, 115, 22, ${0.18 + pulse * 0.12})`;
         c.fill();
         c.strokeStyle = `rgba(251, 146, 60, ${0.65 + pulse * 0.3})`;
@@ -470,7 +364,7 @@
 
       // 4. 伏擊閃爍
       if (flags.ambushFlash) {
-        drawTileMarkPath(c, tile, metrics, 0.94);
+        drawTileMarkPath(c, tile, 0.94);
         c.fillStyle = `rgba(239, 68, 68, ${0.22 + pulse * 0.24})`;
         c.fill();
         c.strokeStyle = pulse > 0.5 ? '#ef4444' : '#f59e0b';
@@ -480,7 +374,7 @@
 
       // 5. 可攻擊目標脈動紅框
       if (flags.attackable) {
-        drawTileMarkPath(c, tile, metrics, 0.94);
+        drawTileMarkPath(c, tile, 0.94);
         c.fillStyle = `rgba(239, 68, 68, ${0.24 + pulse * 0.18})`;
         c.fill();
         c.strokeStyle = pulse > 0.5 ? '#fecaca' : '#ef4444';
@@ -492,7 +386,7 @@
       if (flags.replayMarkers && flags.replayMarkers.length) {
         for (const marker of flags.replayMarkers) {
           c.save();
-          drawTileMarkPath(c, tile, metrics, 0.88);
+          drawTileMarkPath(c, tile, 0.88);
           let strokeColor = '#7dd3fc';
           if (marker.kind === 'from') { c.setLineDash([4, 3]); strokeColor = '#7dd3fc'; }
           else if (marker.kind === 'to') strokeColor = '#22d3ee';
@@ -527,7 +421,7 @@
 
       // 7. 滑鼠懸停格亮邊
       if (flags.isHovered) {
-        drawTileMarkPath(c, tile, metrics, 0.96);
+        drawTileMarkPath(c, tile, 0.96);
         c.strokeStyle = 'rgba(255, 255, 255, 0.88)';
         c.lineWidth = 2;
         c.stroke();
@@ -973,10 +867,10 @@
      * ========================================================= */
     function drawHoverMovePath(c, metrics) {
       if (!scene || !scene.board || !hover.previewPath || hover.previewPath.length < 2) return;
-      const pts = hover.previewPath.map(p => {
-        const elev = scene.board.map[p.y][p.x].elev || 0;
-        return projectBase(p.x, p.y, elev, metrics);
-      });
+      const path = hover.previewPath;
+      const map = scene.board.map;
+      const project = (x, y) => projectBase(x, y, terrainModule.heightAt(map, x, y), metrics);
+      const pts = path.map(p => project(p.x, p.y));
 
       c.save();
       // 外發光路徑線
@@ -985,7 +879,15 @@
       c.lineCap = 'round';
       c.lineJoin = 'round';
       c.beginPath();
-      pts.forEach((p, i) => (i === 0 ? c.moveTo(p.bx, p.by) : c.lineTo(p.bx, p.by)));
+      c.moveTo(pts[0].bx, pts[0].by);
+      for (let i = 1; i < path.length; i++) {
+        const from = path[i - 1], to = path[i];
+        for (let step = 1; step <= 8; step++) {
+          const t = step / 8;
+          const point = project(lerp(from.x, to.x, t), lerp(from.y, to.y, t));
+          c.lineTo(point.bx, point.by);
+        }
+      }
       c.stroke();
 
       c.strokeStyle = 'rgba(224, 242, 254, 0.95)';
@@ -1004,7 +906,7 @@
       }
 
       // 終點 MP 氣泡
-      const lastCoord = hover.previewPath[hover.previewPath.length - 1];
+      const lastCoord = path[path.length - 1];
       const lastPt = pts[pts.length - 1];
       const previous = pts[pts.length - 2];
       const angle = Math.atan2(lastPt.by - previous.by, lastPt.bx - previous.bx);
@@ -1098,11 +1000,10 @@
           }
           const elevA = scene.board.map[a.y][a.x].elev || 0;
           const elevB = scene.board.map[b.y][b.x].elev || 0;
-          const hop = Math.sin(segT * Math.PI) * (elevA !== elevB ? 0.36 : 0.12);
-          const pos = projectFloatBase(
-            lerp(a.x, b.x, segT), lerp(a.y, b.y, segT),
-            lerp(elevA, elevB, segT) + hop, metrics
-          );
+          const hop = Math.sin(segT * Math.PI) * (elevA !== elevB ? 0.13 : 0.12);
+          const x = lerp(a.x, b.x, segT);
+          const y = lerp(a.y, b.y, segT);
+          const pos = projectFloatBase(x, y, terrainModule.heightAt(scene.board.map, x, y) + hop, metrics);
           unitOverrides.set(fx.unitId, pos);
           if (fx.isCharge) renderFx.push({ kind: 'chargeTrail', bx: pos.bx, by: pos.by, t });
         } else if (fx.type === 'attack') {
@@ -1339,7 +1240,7 @@
       return layer;
     }
 
-    function drawTurningPlinth(c, metrics) {
+    function drawDioramaPlinth(c, metrics) {
       const n = BOARD_SIZE - 0.5;
       const corners = [[-0.5, -0.5], [n, -0.5], [n, n], [-0.5, n]]
         .map(([x, y]) => projectBase(x, y, 0, metrics));
@@ -1369,11 +1270,27 @@
         c.lineTo(p.bx, p.by + h);
         c.closePath();
         c.fill();
+        if (p.bx - q.bx < 38) continue;
+        const axis = i % 2 === 0 ? 'X' : 'Y';
+        const reverse = i >= 2;
+        const font = clamp(metrics.tw * 0.175, 8.5, 13);
+        const tick = Math.max(1, Math.ceil(BOARD_SIZE * font / (p.bx - q.bx)));
+        c.font = `800 ${font}px system-ui, sans-serif`;
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        c.fillStyle = 'rgba(232, 220, 196, 0.86)';
+        for (let j = 0; j < BOARD_SIZE; j += tick) {
+          const t = (j + 0.5) / BOARD_SIZE;
+          c.fillText(String(reverse ? BOARD_SIZE - 1 - j : j), lerp(p.bx, q.bx, t),
+            lerp(p.by, q.by, t) + h * 0.56);
+        }
+        c.fillStyle = '#fbbf24';
+        c.fillText(axis, reverse ? q.bx - 8 : p.bx + 8, (reverse ? q.by : p.by) + h * 0.58);
       }
     }
 
     function getOrderedTiles() {
-      if (!camera.rotation && orderedTiles && orderedRotation === camera.rot) return orderedTiles;
+      if (orderedTiles && orderedAngle === camera.theta) return orderedTiles;
       const tiles = [];
       for (let y = 0; y < BOARD_SIZE; y++) {
         for (let x = 0; x < BOARD_SIZE; x++) {
@@ -1381,11 +1298,12 @@
           tiles.push({ x, y, rx, ry, key: keyOf(x, y) });
         }
       }
-      tiles.sort((a, b) => (a.rx + a.ry) - (b.rx + b.ry) || a.rx - b.rx);
-      if (!camera.rotation) {
-        orderedTiles = tiles;
-        orderedRotation = camera.rot;
-      }
+      tiles.sort((a, b) => {
+        const depth = (a.rx + a.ry) - (b.rx + b.ry);
+        return Math.abs(depth) > 1e-8 ? depth : a.rx - b.rx;
+      });
+      orderedTiles = tiles;
+      orderedAngle = camera.theta;
       return tiles;
     }
 
@@ -1425,32 +1343,46 @@
       if (camera.rotation) {
         const { start, from, to } = camera.rotation;
         const t = clamp((nowMs - start) / 250, 0, 1);
-        camera.theta = lerp(from, to, easeInOutQuad(t));
+        setAngle(lerp(from, to, easeInOutQuad(t)));
         if (t >= 1) {
           camera.rotation = null;
-          camera.theta = camera.rot * Math.PI * 0.5;
           cameraChanged = true;
         }
       }
 
-      ctx.save();
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      backgroundCache ||= cachedCanvas(drawBackground);
-      ctx.drawImage(backgroundCache, 0, 0, width, height);
-      ctx.translate(width * 0.5 + camera.panX, height * 0.5 + camera.panY);
-      ctx.scale(camera.zoom, camera.zoom);
-      ctx.translate(-width * 0.5, -height * 0.5);
-
-      if (camera.rotation) {
-        drawTurningPlinth(ctx, metrics);
-      } else {
-        if (plinthCache?.rot !== camera.rot) {
-          plinthCache = { rot: camera.rot, canvas: cachedCanvas(c => drawDioramaPlinth(c, metrics)) };
+      // 自由轉動時使用低成本的即時畫布，放手後立即補上原解析度。
+      const turning = isTurning() && dpr > 1;
+      let renderCtx = ctx;
+      let frameDpr = dpr;
+      if (turning) {
+        cameraLayer ||= makeCanvas();
+        if (cameraLayer.width !== width || cameraLayer.height !== height) {
+          cameraLayer.width = width;
+          cameraLayer.height = height;
         }
-        ctx.drawImage(plinthCache.canvas, 0, 0, width, height);
+        cameraLayerValid = false;
+        renderCtx = cameraLayer.getContext('2d');
+        frameDpr = 1;
       }
 
-      const movingCamera = !camera.rotation && (camera.anim || dragState?.moved ||
+      renderCtx.save();
+      renderCtx.setTransform(frameDpr, 0, 0, frameDpr, 0, 0);
+      backgroundCache ||= cachedCanvas(drawBackground);
+      renderCtx.drawImage(backgroundCache, 0, 0, width, height);
+      renderCtx.translate(width * 0.5 + camera.panX, height * 0.5 + camera.panY);
+      renderCtx.scale(camera.zoom, camera.zoom);
+      renderCtx.translate(-width * 0.5, -height * 0.5);
+
+      if (isTurning()) {
+        drawDioramaPlinth(renderCtx, metrics);
+      } else {
+        if (plinthCache?.theta !== camera.theta) {
+          plinthCache = { theta: camera.theta, canvas: cachedCanvas(c => drawDioramaPlinth(c, metrics)) };
+        }
+        renderCtx.drawImage(plinthCache.canvas, 0, 0, width, height);
+      }
+
+      const movingCamera = !isTurning() && (camera.anim || dragState?.moved ||
         pinchState || nowMs - lastInteraction < 105);
       const canReuse = movingCamera && !activeEffects.length && !scene.floatEffects?.length &&
         !terrainRenderer.hasActiveAnimation?.(nowMs);
@@ -1465,12 +1397,12 @@
           drawBoardContents(layerCtx, nowMs, metrics, nowSec);
           cameraLayerValid = true;
         }
-        ctx.drawImage(cameraLayer, 0, 0, width, height);
+        renderCtx.drawImage(cameraLayer, 0, 0, width, height);
       } else {
         cameraLayerValid = false;
-        drawBoardContents(ctx, nowMs, metrics, nowSec);
+        drawBoardContents(renderCtx, nowMs, metrics, nowSec);
       }
-      drawParticles(ctx, nowSec, metrics);
+      drawParticles(renderCtx, nowSec, metrics);
 
       // 7. 藍方輪到提示柔光邊框（對應經典版 blue-turn-pulse）
       if (pulseStart > 0 && !isReducedMotion()) {
@@ -1478,18 +1410,22 @@
         if (pt >= 1) {
           pulseStart = 0;
         } else {
-          ctx.restore();
-          ctx.save();
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          renderCtx.restore();
+          renderCtx.save();
+          renderCtx.setTransform(frameDpr, 0, 0, frameDpr, 0, 0);
           const a = Math.sin(pt * Math.PI) * 0.72;
-          ctx.strokeStyle = `rgba(96, 165, 250, ${a})`;
-          ctx.lineWidth = 4;
-          drawRoundedRectPath(ctx, 2, 2, width - 4, height - 4, 12);
-          ctx.stroke();
+          renderCtx.strokeStyle = `rgba(96, 165, 250, ${a})`;
+          renderCtx.lineWidth = 4;
+          drawRoundedRectPath(renderCtx, 2, 2, width - 4, height - 4, 12);
+          renderCtx.stroke();
         }
       }
 
-      ctx.restore();
+      renderCtx.restore();
+      if (turning) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(cameraLayer, 0, 0, canvas.width, canvas.height);
+      }
       if (cameraChanged) emitCameraChange(false);
     }
 
@@ -1497,13 +1433,13 @@
       const { unitOverrides, renderFx, casualties, pendingHealth } = pruneAndSampleEffects(nowMs);
       const board = scene.board;
       const selUnit = scene.selUnit || null;
-      const hovered = camera.rotation ? null : hover.hoveredTile;
+      const hovered = isTurning() ? null : hover.hoveredTile;
       const hoveredRot = hovered ? rotatedPoint(hovered.x, hovered.y) : null;
       const selRot = selUnit ? rotatedPoint(selUnit.x, selUnit.y) : null;
       const project = (x, y, elev) => projectBase(x, y, elev, metrics);
       const frame = {
-        quality, metrics, nowMs, project, projectFloat: project, rot: camera.rot,
-        theta: camera.theta, zoom: camera.zoom, dpr, gridVisible, assetVersion,
+        quality, metrics, nowMs, projectFloat: project, terrain: getTerrain(metrics),
+        zoom: camera.zoom, gridVisible, assetVersion, turning: isTurning(),
         reducedMotion: isReducedMotion()
       };
 
@@ -1516,16 +1452,16 @@
       for (const [order, { x, y, rx, ry, key }] of tiles.entries()) {
         const cell = board.map[y][x];
         const { bx, by } = project(x, y, cell.elev || 0);
-        const hill = cell.elev ? terrainModule.projectHill(board.map, x, y, project) : null;
-        const tile = { x, y, bx, by, cell, hill };
+        const surface = frame.terrain[y * BOARD_SIZE + x];
+        const tile = { x, y, bx, by, cell, surface };
         const isVis = scene.visibleTiles[y][x];
         const unit = scene.visibleUnitsByKey.get(key) || null;
         const ghost = !unit && scene.ghostsByKey?.get(key);
         const fallen = !unit && casualties.get(key);
         const occupied = Boolean(unit || ghost || fallen);
         const isHovered = hovered?.x === x && hovered.y === y;
-        const inFrontOf = point => point && rx >= point.rx && ry >= point.ry &&
-          rx - point.rx <= 1 && ry - point.ry <= 1;
+        const inFrontOf = point => point && rx + ry >= point.rx + point.ry &&
+          Math.hypot(rx - point.rx, ry - point.ry) <= Math.SQRT2 + 1e-7;
         const softFade = isHovered || Boolean(inFrontOf(hoveredRot) || inFrontOf(selRot));
         const flags = {
           enemyAttack: scene.enemyAttackKeys.has(key),
@@ -1536,8 +1472,8 @@
           isHovered
         };
 
-        if (hill) {
-          terrainRenderer.drawHill(ctx, scene, frame, tile);
+        terrainRenderer.drawRelief(ctx, frame, tile);
+        if (cell.elev) {
           occluders.push({
             left: bx - metrics.tw * 0.38, right: bx + metrics.tw * 0.38,
             top: by - metrics.th * 0.35, bottom: by + metrics.th * 0.5 + metrics.elevH, order: order * 2 - 1
@@ -1565,7 +1501,7 @@
               turnsAgo: piece === ghost ? Math.max(0, board.turn - ghost.turn) : 0,
               isSelected: Boolean(unit && selUnit?.id === unit.id),
               recordHitBox: Boolean(unit), order: order * 2,
-              rot: camera.rot, zoom: camera.zoom, dpr
+              theta: camera.theta, zoom: camera.zoom, dpr
             };
             unitArt.drawMiniature(ctx, piece, ov?.bx ?? bx, ov?.by ?? by,
               metrics, opts, nowSec, unitHudQueue, unitHitBoxes);
@@ -1592,7 +1528,7 @@
       });
 
       // 4. 懸停移動路徑線（繪在地形與棋子層之上，指引清晰）
-      if (!camera.rotation) drawHoverMovePath(ctx, metrics);
+      if (!isTurning()) drawHoverMovePath(ctx, metrics);
 
       // 5. 動態攻擊／箭矢／衝鋒／伏擊特效
       drawForegroundEffects(ctx, renderFx, metrics);
@@ -1688,8 +1624,8 @@
 
     function onMotionPreferenceChange() {
       if (isReducedMotion()) {
+        if (camera.rotation) setAngle(camera.rotation.to);
         camera.rotation = null;
-        camera.theta = camera.rot * Math.PI * 0.5;
         if (camera.anim) {
           camera.zoom = camera.anim.toZoom;
           camera.panX = camera.anim.toPanX;
@@ -1725,7 +1661,7 @@
     }
 
     function handlePointerDown(e) {
-      if (!active || camera.rotation) return;
+      if (!active || camera.rotation || pointers.size >= 2) return;
       if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 1 && e.button !== 2) return;
       canvas.setPointerCapture?.(e.pointerId);
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
@@ -1740,8 +1676,11 @@
         pinchState = {
           startDist: Math.max(12, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y)),
           startZoom: camera.zoom,
-          midBaseX: midBase.bx,
-          midBaseY: midBase.by
+          startTheta: camera.theta,
+          previousAngle: Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x),
+          twist: 0,
+          turned: false,
+          anchor: groundPoint(midBase.bx, midBase.by, getMetrics())
         };
         dragState = null;
         camera.anim = null;
@@ -1759,6 +1698,7 @@
           downY: e.clientY,
           startPanX: camera.panX,
           startPanY: camera.panY,
+          startTheta: camera.theta,
           moved: false
         };
       }
@@ -1779,8 +1719,14 @@
         const midSx = (pts[0].x + pts[1].x) * 0.5 - rect.left;
         const midSy = (pts[0].y + pts[1].y) * 0.5 - rect.top;
         camera.zoom = clamp(pinchState.startZoom * (dist / pinchState.startDist), MIN_ZOOM, MAX_ZOOM);
-        camera.panX = midSx - width * 0.5 - (pinchState.midBaseX - width * 0.5) * camera.zoom;
-        camera.panY = midSy - height * 0.5 - (pinchState.midBaseY - height * 0.5) * camera.zoom;
+        const angle = Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x);
+        pinchState.twist += normalizeAngle(angle - pinchState.previousAngle);
+        pinchState.previousAngle = angle;
+        if (Math.abs(pinchState.twist) > 0.075) pinchState.turned = true;
+        if (pinchState.turned) setAngle(pinchState.startTheta + pinchState.twist);
+        const { bx, by } = projectBase(pinchState.anchor.x, pinchState.anchor.y);
+        camera.panX = midSx - width * 0.5 - (bx - width * 0.5) * camera.zoom;
+        camera.panY = midSy - height * 0.5 - (by - height * 0.5) * camera.zoom;
         clampPan();
         markDirty();
         emitCameraChange(true);
@@ -1796,9 +1742,13 @@
           canvas.classList.add('is-dragging');
         }
         if (dragState.moved) {
-          camera.panX = dragState.startPanX + dx;
-          camera.panY = dragState.startPanY + dy;
-          clampPan();
+          if (dragState.button === 2) {
+            setAngle(dragState.startTheta + dx * 0.0105);
+          } else {
+            camera.panX = dragState.startPanX + dx;
+            camera.panY = dragState.startPanY + dy;
+            clampPan();
+          }
           markDirty();
           emitCameraChange(true);
           return;
@@ -1820,13 +1770,22 @@
       if (!active) return;
       const wasDrag = dragState && dragState.pointerId === e.pointerId ? dragState : null;
       pointers.delete(e.pointerId);
-      if (pointers.size < 2) pinchState = null;
+      if (pinchState && pointers.size < 2) {
+        pinchState = null;
+        emitCameraChange(false);
+        markDirty();
+      }
 
       if (wasDrag) {
         dragState = null;
         canvas.classList.remove('is-dragging');
         if (wasDrag.moved) {
           emitCameraChange(false);
+          markDirty();
+          if (e.type === 'pointerup' && wasDrag.button === 2 && lastPointer) {
+            const hit = pickTileAtClient(lastPointer.x, lastPointer.y);
+            if (hit) callbacks.onTileHover?.(hit.x, hit.y);
+          }
           return;
         }
         // 未超過門檻且為左鍵（或觸控單擊）→ 執行精準選格
@@ -1858,6 +1817,7 @@
     canvas.addEventListener('pointermove', handlePointerMove);
     canvas.addEventListener('pointerup', handlePointerUpOrCancel);
     canvas.addEventListener('pointercancel', handlePointerUpOrCancel);
+    canvas.addEventListener('lostpointercapture', handlePointerUpOrCancel);
     canvas.addEventListener('pointerleave', handlePointerLeave);
     canvas.addEventListener('contextmenu', handleContextMenu);
 
@@ -1891,8 +1851,8 @@
           cameraLayer = null;
           cameraLayerValid = false;
           lastPointer = null;
+          if (camera.rotation) setAngle(camera.rotation.to);
           camera.rotation = null;
-          camera.theta = camera.rot * Math.PI * 0.5;
           pointers.clear();
           dragState = null;
           pinchState = null;
@@ -1952,13 +1912,13 @@
 
       rotate(delta) {
         if (camera.rotation || dragState || pinchState) return;
-        const step = delta >= 0 ? 1 : -1;
+        const target = camera.theta + (delta >= 0 ? QUARTER_TURN : -QUARTER_TURN);
         if (!isReducedMotion()) {
           camera.rotation = { start: performance.now(), from: camera.theta,
-            to: camera.theta + step * Math.PI * 0.5 };
+            to: target };
+        } else {
+          setAngle(target);
         }
-        camera.rot = (camera.rot + step + 4) % 4;
-        if (!camera.rotation) camera.theta = camera.rot * Math.PI * 0.5;
         unitHitBoxes = [];
         lastInteraction = performance.now();
         markDirty();
@@ -1990,8 +1950,7 @@
       },
 
       resetCamera() {
-        camera.rot = 0;
-        camera.theta = 0;
+        setAngle(0);
         camera.rotation = null;
         unitHitBoxes = [];
         const nowMs = typeof performance === 'object' ? performance.now() : Date.now();
@@ -2017,12 +1976,13 @@
       },
 
       getCameraState() {
-        return { zoom: camera.zoom, rot: camera.rot, panX: camera.panX, panY: camera.panY };
+        const rot = (Math.round(camera.theta / QUARTER_TURN) + 4) % 4;
+        return { zoom: camera.zoom, theta: camera.theta, rot, panX: camera.panX, panY: camera.panY };
       },
 
       // 回傳該格單位上方在 hostEl 內的螢幕定位點，供戰鬥預測浮動小窗精準對齊
       getTileScreenPoint(x, y) {
-        if (!scene || !scene.board || camera.rotation) return null;
+        if (!scene || !scene.board || isTurning()) return null;
         const metrics = getMetrics();
         const elev = scene.board.map[y][x].elev || 0;
         const base = projectBase(x, y, elev, metrics);
@@ -2050,6 +2010,7 @@
         canvas.removeEventListener('pointermove', handlePointerMove);
         canvas.removeEventListener('pointerup', handlePointerUpOrCancel);
         canvas.removeEventListener('pointercancel', handlePointerUpOrCancel);
+        canvas.removeEventListener('lostpointercapture', handlePointerUpOrCancel);
         canvas.removeEventListener('pointerleave', handlePointerLeave);
         canvas.removeEventListener('contextmenu', handleContextMenu);
       }
