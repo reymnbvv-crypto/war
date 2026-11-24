@@ -155,6 +155,10 @@
 
 ## 六、近期對話紀錄（Session Log）
 
+- **2026-11-23｜右側數值介面硬性定高與零抖動優化（選項 A）**
+  - **問題定位**：實測 `1366×900` 視窗下 `#inspectorCard` 隨懸停目標於 `74px～309px` 伸縮，且跨過 `900px` 視窗臨界導致瀏覽器右側捲軸反覆出現／消失，引發整頁與 2.5D Canvas 嚴重左右及上下抖動。
+  - **拍板與實作**：僅調整 [`index.html`](./index.html)（不動核心引擎與 AI）：桌面端鎖死 `#inspectorCard` 為硬性固定高度 **`324px`**（內部採 Flex + `thin-scroll` 溢出保護）、`html` 加上 `scrollbar-gutter: stable`、鎖定 `#statusBanner`（`42px`）與 `#actionSubHint`（`2.35rem`）最小高度，並依選項 A 將 `#battleLog` 調整為與左欄切齊（`pve`/`hotseat` `11.25rem`，`aivai`/`replaying` 自動縮至 `7.5rem`）。
+  - **像素級驗證**：Playwright 跨 7 狀態實測 `cardH` 恆為 `324px`、`logY` 恆為 `631px`、`boardX` 恆為 `52px`（含展開速查至 `1175px` 亦為 0px 橫移）、三模式 `docScrollH === 900px` 零頁面捲軸、無意外內部溢位，且全套 2.5D / 0-AI / 回放 / `file://` E2E 測試全數通過。
 - **2026-11-23｜新增 2.5D 高清奇幻微縮沙盤地圖模式與介面全面優化**
   - **設計拍板**：確認採純原生 Canvas 2D **2.5D 高清圖**（奇幻自然地景微縮沙盤風、純造型五兵種、預設開啟動畫與飄霧、支援縮放／6px 防誤觸平移／4 向 90° 旋轉），預設維持**戰略圖**並於地圖下方設單一切換按鈕（`切換高清圖` ↔ `切換戰略圖`）；右側即時戰鬥預測採**方案 C**（與檢視區同區切換，僅選中己方單位並懸停可攻敵軍時顯示）並於可攻敵子旁增加遵守迷霧之簡潔攻防／反擊小窗；修復「AI 對弈觀戰」於非 `aivai` 模式誤顯示 Bug（AI 難度選單維持原樣）。
   - **程式碼與部署變更**：新增 [`render/board-25d.js`](./render/board-25d.js)，更新 [`index.html`](./index.html)（修復 `.hidden !important`、2.5D 渲染橋接與鏡頭工具列、方案 C 卡片、雙模式懸停戰鬥小窗、高清圖大螢幕加寬與戰報高度優化、迷霧零洩密特效事件派發）與 [`.github/workflows/pages.yml`](./.github/workflows/pages.yml)（發佈產物納入 `render/*.js`），並同步 [`README.md`](./README.md)、[`AGENTS.md`](./AGENTS.md) 與 [`PROGRESS.md`](./PROGRESS.md)。

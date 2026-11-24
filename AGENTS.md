@@ -52,8 +52,9 @@
 - **雙地圖模式切換（戰略圖 ↔ 2.5D 高清圖）**：
   - 地圖正下方以單一按鈕切換（`切換高清圖` ↔ `切換戰略圖`），初次預設為**戰略圖**（記憶於 `localStorage`）；可於人機／熱座／AI 對弈／回放中即時無縫切換。
   - 2.5D 高清圖（[`render/board-25d.js`](./render/board-25d.js)）為純原生 Canvas 2D 奇幻自然地景微縮沙盤與純造型兵種，支援游標中心縮放、6px 防誤觸平移、4 向 90° 旋轉、逆畫家序解析點格（`resize()` 須量測 `canvas.getBoundingClientRect()` 避免外框邊界偏移）與嚴格迷霧零洩密動畫。
-- **戰鬥預測（方案 C）與棋子懸停簡潔小窗**：
-  - 右側「單位與地形檢視」與「即時戰鬥預測拆解」採同區切換（零版面跳動），唯有選中己方單位並懸停於可攻擊敵軍上方時才切換顯示預測，同時於該敵子上方浮現簡潔攻防／反擊小窗（雙模式共用、嚴格呼叫 `createObservedBoard` 遵守迷霧）。
+- **戰鬥預測（方案 C）、硬性定高檢視卡與零抖動排版**：
+  - 右側「單位與地形檢視」與「即時戰鬥預測拆解」採同區切換（`#inspectorCard` 桌面固定硬性高度 `324px`、內部自適應捲動安全網），唯有選中己方單位並懸停於可攻擊敵軍上方時才切換顯示預測，同時於該敵子上方浮現簡潔攻防／反擊小窗（雙模式共用、嚴格呼叫 `createObservedBoard` 遵守迷霧）。
+  - 全域 `html { scrollbar-gutter: stable; }` 搭配選項 A 戰報區高度平衡（`pve`/`hotseat` `11.25rem`、`aivai`/`replaying` `7.5rem`）及 `#statusBanner`/`#actionSubHint` 固定最小高度，確保懸停、切換模式或展開速查時零左右／上下抖動。
   - CSS `.hidden` 須維持 `display: none !important;` 避免被 `.spectator-panel` 等 `display: flex` 規則覆寫；「AI 對弈觀戰」與「藍方 AI」僅於 `aivai` 模式顯示，頂部「AI 難度」選單維持於各模式顯示（熱座時停用）。
 - **彈窗與焦點管理**：所有模態視窗統一納入 `MODAL_IDS`，經由 `setModalOpen` / `syncModalState` 控制 `inert` 與焦點還原。
 

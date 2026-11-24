@@ -9,6 +9,10 @@
       box-sizing: border-box;
     }
 
+    html {
+      scrollbar-gutter: stable;
+    }
+
     body {
       font-family: system-ui, "PingFang TC", "Microsoft JhengHei", sans-serif;
       background-color: #0b1120;
@@ -1138,20 +1142,61 @@
       font-weight: 900;
     }
 
-    /* 方案 C：單位與地形檢視／即時戰鬥預測同區切換卡片 */
+    /* 方案 C：單位與地形檢視／即時戰鬥預測同區切換卡片（桌面硬性定高，僅內容增減零抖動） */
+    #inspectorCard {
+      display: flex;
+      flex-direction: column;
+    }
+
+    #inspectorSection,
+    #combatPreviewPanel {
+      display: flex;
+      flex-direction: column;
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+
+    #inspectorBody,
+    #combatPreviewBody {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      scrollbar-gutter: stable;
+    }
+
     #inspectorCard.is-combat-preview {
       border-color: rgba(244, 63, 94, 0.65);
       box-shadow: 0 0 0 1px rgba(244, 63, 94, 0.22), 0 10px 24px rgba(0, 0, 0, 0.48);
     }
 
-    /* 戰報紀錄高度優化（隱藏觀戰與常駐預測後釋出空間） */
+    /* 鎖定次要微抖元件最小高度 */
+    #statusBanner {
+      min-height: 42px;
+    }
+
+    #actionSubHint {
+      min-height: 2.35rem;
+      display: flex;
+      align-items: center;
+    }
+
+    /* 戰報紀錄高度平衡（選項 A：與左側棋盤切齊且三模式一致不溢頁） */
     .battle-log-list {
-      height: 15.5rem;
+      height: 11.5rem;
     }
 
     @media (min-width: 1024px) {
+      #inspectorCard {
+        height: 324px;
+      }
+
       .battle-log-list {
-        height: 18rem;
+        height: 11.25rem;
+      }
+
+      #battleLayout.is-aivai .battle-log-list,
+      #battleLayout.replaying .battle-log-list {
+        height: 7.5rem;
       }
     }
 
@@ -1408,26 +1453,26 @@
         </div>
       </div>
 
-      <!-- 方案 C：單位與地形檢視／即時戰鬥預測同區切換卡片（零版面跳動） -->
+      <!-- 方案 C：單位與地形檢視／即時戰鬥預測同區切換卡片（桌面硬性定高，零版面跳動） -->
       <div id="inspectorCard" class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 shadow-lg">
         <!-- 平常顯示：選中單位與戰場地形檢視 -->
         <div id="inspectorSection">
-          <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center justify-between mb-2 shrink-0">
             <h2 class="text-sm font-bold text-slate-200">單位與地形檢視</h2>
             <span id="inspectCoord" class="text-xs font-mono text-slate-400">移至棋盤查看</span>
           </div>
-          <div id="inspectorBody" class="text-xs text-slate-300 space-y-2">
+          <div id="inspectorBody" class="thin-scroll pr-1 text-xs text-slate-300 space-y-2">
             <div class="text-slate-400">懸停或點選方格，檢視海拔、林內隱蔽狀態、控制區與單位屬性。</div>
           </div>
         </div>
 
         <!-- 選中棋子並懸停於可攻擊敵軍上方時切換顯示：即時戰鬥預測拆解 -->
         <div id="combatPreviewPanel" class="hidden">
-          <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center justify-between mb-2 shrink-0">
             <h2 class="text-sm font-bold text-rose-300">即時戰鬥預測拆解</h2>
             <span id="previewBadge" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-400">待命</span>
           </div>
-          <div id="combatPreviewBody" class="text-xs text-slate-400 leading-relaxed">
+          <div id="combatPreviewBody" class="thin-scroll pr-1 text-xs text-slate-400 leading-relaxed">
             選中己方單位後，滑鼠懸停紅框敵軍即可檢視逐項攻防修正、破盾衝散與反擊預測。
           </div>
         </div>
@@ -3336,7 +3381,9 @@
   }
 
   function renderReplayControls() {
-    document.getElementById('battleLayout').classList.toggle('replaying', Boolean(replay));
+    const battleLayout = document.getElementById('battleLayout');
+    battleLayout.classList.toggle('replaying', Boolean(replay));
+    battleLayout.classList.toggle('is-aivai', !replay && isAiVsAi());
     document.getElementById('replayControls').classList.toggle('hidden', !replay);
     document.getElementById('spectatorPanel').classList.toggle('hidden', Boolean(replay) || !isAiVsAi());
     document.getElementById('liveControlsPanel').classList.toggle('hidden', Boolean(replay) || isAiVsAi());
