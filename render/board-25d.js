@@ -266,8 +266,9 @@
       const halfW = tw * 0.5;
       const halfH = th * 0.5;
       const map = scene.board.map;
+      const project = (x, y, elev) => projectBase(x, y, elev, metrics);
 
-      // 由最前景往最背景逐格檢測：先命中的即為玩家眼前最靠前的表面（含高地頂面與岩壁）
+      // 由最前景往最背景逐格檢測：先命中的即為玩家眼前最靠前的表面（含高地頂面與碎石坡）
       for (let sum = (BOARD_SIZE - 1) * 2; sum >= 0; sum--) {
         for (let rx = BOARD_SIZE - 1; rx >= 0; rx--) {
           const ry = sum - rx;
@@ -277,22 +278,14 @@
           const cx = metrics.originX + (rx - ry) * halfW;
           const cy = metrics.originY + (rx + ry) * halfH - elev * elevH;
 
-          // 1. 頂面菱形精確解析判定
           const dx = Math.abs(bx - cx);
-          if (dx <= halfW) {
-            const dy = Math.abs(by - cy);
-            if (dx / halfW + dy / halfH <= 1.0005) {
-              return { x, y };
-            }
-            // 2. 高地前側左右岩壁判定（保留外緣 1px 不搶走後方相鄰平地格心）
-            if (elev > 0 && dx < halfW - 1) {
-              const topEdgeY = cy + (1 - dx / halfW) * halfH;
-              const sides = terrainModule.exposedSides(map, x, y, camera.rot);
-              const exposed = bx < cx ? sides.left : sides.right;
-              if (exposed && by >= topEdgeY && by <= topEdgeY + elevH) {
-                return { x, y };
-              }
-            }
+          if (dx > halfW) continue;
+          if (elev) {
+            if (by < cy - halfH || by > cy + halfH + elev * elevH) continue;
+            const hill = terrainModule.projectHill(map, x, y, project);
+            if (terrainModule.hillContains(hill, bx, by)) return { x, y };
+          } else if (dx / halfW + Math.abs(by - cy) / halfH <= 1.0005) {
+            return { x, y };
           }
         }
       }
@@ -432,34 +425,27 @@
       c.fillText(bottomRightAxis, rightX + tw * 0.16, rightY + plinthH * 0.65);
     }
 
-    function drawForestConcealOverlay(c, bx, by, metrics) {
-      const { tw, th } = metrics;
-      drawDiamondPath(c, bx, by, tw * 0.5, th * 0.5);
-      c.fillStyle = 'rgba(8, 20, 32, 0.26)';
-      c.fill();
-
-      // 林內未近距探明角標「隱」
-      const badgeW = clamp(tw * 0.22, 13, 18);
-      const badgeH = clamp(th * 0.36, 12, 15);
-      const px = bx - badgeW * 0.5;
-      const py = by + th * 0.14;
-      drawRoundedRectPath(c, px, py, badgeW, badgeH, 3);
-      c.fillStyle = 'rgba(15, 23, 42, 0.78)';
-      c.fill();
-      c.strokeStyle = 'rgba(110, 231, 183, 0.55)';
-      c.lineWidth = 0.9;
-      c.stroke();
-      c.fillStyle = '#a7f3d0';
-      c.font = `800 ${clamp(tw * 0.145, 8.5, 11)}px system-ui, "PingFang TC", sans-serif`;
-      c.textAlign = 'center';
-      c.textBaseline = 'middle';
-      c.fillText('隱', bx, py + badgeH * 0.52);
-    }
-
     /* =========================================================
      * 戰術高亮疊層（ZoC、上回合軌跡、可達格、衝鋒格、可攻格、回放標記）
      * ========================================================= */
-    function drawTileTacticalOverlays(c, x, y, bx, by, metrics, flags, nowSec) {
+    function drawTileMarkPath(c, tile, metrics, scale) {
+      const { bx, by, hill } = tile;
+      if (!hill) {
+        drawDiamondPath(c, bx, by, metrics.tw * 0.5 * scale, metrics.th * 0.5 * scale);
+        return;
+      }
+      c.beginPath();
+      for (const [i, point] of hill.top.entries()) {
+        const x = lerp(bx, point.bx, scale);
+        const y = lerp(by, point.by, scale);
+        if (i === 0) c.moveTo(x, y);
+        else c.lineTo(x, y);
+      }
+      c.closePath();
+    }
+
+    function drawTileTacticalOverlays(c, tile, metrics, flags, nowSec) {
+      const { bx, by } = tile;
       const { tw, th } = metrics;
       const halfW = tw * 0.5;
       const halfH = th * 0.5;
@@ -467,14 +453,14 @@
 
       // 2. 上回合 AI 可見軌跡／攻擊高亮
       if (flags.enemyAttack) {
-        drawDiamondPath(c, bx, by, halfW * 0.92, halfH * 0.92);
+        drawTileMarkPath(c, tile, metrics, 0.92);
         c.fillStyle = 'rgba(244, 63, 94, 0.28)';
         c.fill();
         c.strokeStyle = 'rgba(244, 63, 94, 0.92)';
         c.lineWidth = 2;
         c.stroke();
       } else if (flags.enemyTrail) {
-        drawDiamondPath(c, bx, by, halfW * 0.88, halfH * 0.88);
+        drawTileMarkPath(c, tile, metrics, 0.88);
         c.fillStyle = `rgba(249, 115, 22, ${0.18 + pulse * 0.12})`;
         c.fill();
         c.strokeStyle = `rgba(251, 146, 60, ${0.65 + pulse * 0.3})`;
@@ -484,7 +470,7 @@
 
       // 4. 伏擊閃爍
       if (flags.ambushFlash) {
-        drawDiamondPath(c, bx, by, halfW * 0.94, halfH * 0.94);
+        drawTileMarkPath(c, tile, metrics, 0.94);
         c.fillStyle = `rgba(239, 68, 68, ${0.22 + pulse * 0.24})`;
         c.fill();
         c.strokeStyle = pulse > 0.5 ? '#ef4444' : '#f59e0b';
@@ -494,7 +480,7 @@
 
       // 5. 可攻擊目標脈動紅框
       if (flags.attackable) {
-        drawDiamondPath(c, bx, by, halfW * 0.94, halfH * 0.94);
+        drawTileMarkPath(c, tile, metrics, 0.94);
         c.fillStyle = `rgba(239, 68, 68, ${0.24 + pulse * 0.18})`;
         c.fill();
         c.strokeStyle = pulse > 0.5 ? '#fecaca' : '#ef4444';
@@ -506,7 +492,7 @@
       if (flags.replayMarkers && flags.replayMarkers.length) {
         for (const marker of flags.replayMarkers) {
           c.save();
-          drawDiamondPath(c, bx, by, halfW * 0.88, halfH * 0.88);
+          drawTileMarkPath(c, tile, metrics, 0.88);
           let strokeColor = '#7dd3fc';
           if (marker.kind === 'from') { c.setLineDash([4, 3]); strokeColor = '#7dd3fc'; }
           else if (marker.kind === 'to') strokeColor = '#22d3ee';
@@ -541,7 +527,7 @@
 
       // 7. 滑鼠懸停格亮邊
       if (flags.isHovered) {
-        drawDiamondPath(c, bx, by, halfW * 0.96, halfH * 0.96);
+        drawTileMarkPath(c, tile, metrics, 0.96);
         c.strokeStyle = 'rgba(255, 255, 255, 0.88)';
         c.lineWidth = 2;
         c.stroke();
@@ -1510,8 +1496,6 @@
     function drawBoardContents(ctx, nowMs, metrics, nowSec) {
       const { unitOverrides, renderFx, casualties, pendingHealth } = pruneAndSampleEffects(nowMs);
       const board = scene.board;
-      const showAll = Boolean(scene.showAll);
-      const vv = scene.vision;
       const selUnit = scene.selUnit || null;
       const hovered = camera.rotation ? null : hover.hoveredTile;
       const hoveredRot = hovered ? rotatedPoint(hovered.x, hovered.y) : null;
@@ -1532,9 +1516,9 @@
       for (const [order, { x, y, rx, ry, key }] of tiles.entries()) {
         const cell = board.map[y][x];
         const { bx, by } = project(x, y, cell.elev || 0);
-        const tile = { x, y, bx, by, cell };
-        const isVis = showAll || vv.tileVisible[y][x];
-        const isForestRev = showAll || vv.forestReveal[y][x];
+        const hill = cell.elev ? terrainModule.projectHill(board.map, x, y, project) : null;
+        const tile = { x, y, bx, by, cell, hill };
+        const isVis = scene.visibleTiles[y][x];
         const unit = scene.visibleUnitsByKey.get(key) || null;
         const ghost = !unit && scene.ghostsByKey?.get(key);
         const fallen = !unit && casualties.get(key);
@@ -1552,7 +1536,7 @@
           isHovered
         };
 
-        if (cell.elev) {
+        if (hill) {
           terrainRenderer.drawHill(ctx, scene, frame, tile);
           occluders.push({
             left: bx - metrics.tw * 0.38, right: bx + metrics.tw * 0.38,
@@ -1561,7 +1545,7 @@
         }
         terrainRenderer.drawFog(ctx, scene, frame, tile);
         terrainRenderer.drawTactics(ctx, scene, frame, tile);
-        drawTileTacticalOverlays(ctx, x, y, bx, by, metrics, flags, nowSec);
+        drawTileTacticalOverlays(ctx, tile, metrics, flags, nowSec);
 
         const forest = layer => terrainRenderer.drawForest(ctx, scene, frame, tile, {
           occupied, softFade, isFogged: !isVis, layer
@@ -1595,7 +1579,6 @@
               top: by - metrics.tw * 0.46, bottom: by + metrics.th * 0.35, order: order * 2 + 1
             });
           }
-          if (isVis && !isForestRev) drawForestConcealOverlay(ctx, bx, by, metrics);
         }
         terrainRenderer.drawUpperFog(ctx, scene, frame, tile);
       }

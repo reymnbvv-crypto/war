@@ -8,6 +8,9 @@
   const SIZE = 10;
   const MASK_TILE = 32;
   const MASK_SIZE = SIZE * MASK_TILE;
+  const SLOPE_WIDTH = 0.21;
+  const PLATFORM_JOIN = 0.018;
+  const LEVEL_EDGES = [0, 0, 0, 0];
   // 依世界座標排列北、東、南、西四條邊以及其外法線。
   const SIDES = [
     { dx: 0, dy: -1, a: 0, b: 1 },
@@ -25,12 +28,79 @@
     return Math.max(0, elevAt(map, x, y) - elevAt(map, x + side.dx, y + side.dy));
   }
 
-  // 點格與繪圖共用同一組外露邊。畫面左前、右前分別為旋轉後的 +y、+x。
-  function exposedSides(map, x, y, rot) {
-    return {
-      left: cliffHeight(map, x, y, SIDES[(2 - rot + 4) % 4]) > 0,
-      right: cliffHeight(map, x, y, SIDES[(1 - rot + 4) % 4]) > 0
-    };
+  function edgePoint([ax, ay], [bx, by], fraction) {
+    return [ax + (bx - ax) * fraction, ay + (by - ay) * fraction];
+  }
+
+  // 坡腳落在格邊，頂緣只沿落差邊內收。同高度相鄰格共用頂面。
+  // 使用相同投影輪廓繪製坡面與判定點格。
+  function projectHill(map, x, y, project) {
+    const elevation = elevAt(map, x, y);
+    const drops = SIDES.map(side => cliffHeight(map, x, y, side));
+    const insets = drops.map(drop => drop ? SLOPE_WIDTH : 0);
+    // 同一高度的邊緣少量交疊，避免透出抗鋸齒亮縫。
+    const [north, east, south, west] = insets.map(inset => inset || -PLATFORM_JOIN);
+    const corners = [[west, north], [1 - east, north], [1 - east, 1 - south], [west, 1 - south]];
+    const at = ([u, v], height) => project(x + u - 0.5, y + v - 0.5, height);
+    const edges = SIDES.map((side, i) => {
+      const a = corners[side.a];
+      const b = corners[side.b];
+      const drop = drops[i];
+      if (!drop) return { rim: [at(a, elevation), at(b, elevation)] };
+
+      const cutStart = drops[(i + 3) % 4] ? 0.12 : 0;
+      const cutEnd = drops[(i + 1) % 4] ? 0.12 : 0;
+      const irregularity = (x + y + i) % 2 === 0 ? 0.03 : -0.03;
+      const rim = [cutStart, 0.34, 0.67, 1 - cutEnd].map((fraction, index) => {
+        const [u, v] = edgePoint(a, b, fraction);
+        const offset = index === 1 ? irregularity : index === 2 ? -irregularity : 0;
+        return at([u - side.dx * offset, v - side.dy * offset], elevation);
+      });
+      const foot = [cutStart * 0.42, 1 - cutEnd * 0.42].map(fraction =>
+        at(edgePoint(CORNERS[side.a], CORNERS[side.b], fraction), elevation - drop));
+      return { rim, foot };
+    });
+
+    const slopes = [];
+    function addSlope(rim, foot, shade, textureSpan = 1) {
+      const polygon = [...rim, foot[1], foot[0]];
+      const area = polygon.reduce((sum, point, i) => {
+        const next = polygon[(i + 1) % polygon.length];
+        return sum + point.bx * next.by - point.by * next.bx;
+      }, 0);
+      if (area < -0.01) slopes.push({ polygon, rim, foot, shade, textureSpan });
+    }
+    for (const [i, edge] of edges.entries()) {
+      if (!edge.foot) continue;
+      const shade = i === 1 || i === 2;
+      addSlope(edge.rim, edge.foot, shade);
+      const next = edges[(i + 1) % 4];
+      if (next.foot) {
+        addSlope([edge.rim.at(-1), next.rim[0]], [edge.foot[1], next.foot[0]], shade, 0.14);
+      }
+    }
+    return { top: edges.flatMap(edge => edge.rim), slopes, insets };
+  }
+
+  function polygonContains(points, x, y) {
+    let inside = false;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const a = points[j];
+      const b = points[i];
+      if ((a.by > y) !== (b.by > y) && x < (b.bx - a.bx) * (y - a.by) / (b.by - a.by) + a.bx) inside = !inside;
+    }
+    return inside;
+  }
+
+  function hillContains(hill, x, y) {
+    return polygonContains(hill.top, x, y) || hill.slopes.some(slope => polygonContains(slope.polygon, x, y));
+  }
+
+  function tracePolygon(ctx, points) {
+    ctx.beginPath();
+    ctx.moveTo(points[0].bx, points[0].by);
+    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].bx, points[i].by);
+    ctx.closePath();
   }
 
   function transformSurface(ctx, project, x, y, elev = 0) {
@@ -39,10 +109,6 @@
     const south = project(x, y + 1, elev);
     ctx.transform(east.bx - origin.bx, east.by - origin.by,
       south.bx - origin.bx, south.by - origin.by, origin.bx, origin.by);
-  }
-
-  function surfaceCorners(project, x, y, elev) {
-    return CORNERS.map(([dx, dy]) => project(x + dx - 0.5, y + dy - 0.5, elev));
   }
 
   function roundedRect(ctx, l, t, r, b, [nw, ne, se, sw]) {
@@ -104,6 +170,7 @@
 
     const ground = newCanvas(1, 1);
     const hillSurface = newCanvas(1, 1);
+    const scree = newCanvas(384, 144);
     const forestMask = newCanvas(MASK_SIZE, MASK_SIZE);
     const fogMask = newCanvas(MASK_SIZE, MASK_SIZE);
     const fogClouds = newCanvas(MASK_SIZE, MASK_SIZE);
@@ -120,6 +187,7 @@
     let fogView;
     let hasFog = false;
     let hillSurfaceKey = '';
+    let screeSource;
     let hillPixels = 96;
     let cloudAt = -Infinity;
     let cloudMode = '';
@@ -337,7 +405,7 @@
 
     function prepareFog(scene, frame) {
       const nowMs = frame.nowMs;
-      const vision = scene.vision.tileVisible;
+      const vision = scene.visibleTiles;
       const view = scene.viewKey ?? (scene.showAll ? 'all' : scene.faction);
       const dissolve = scene.animateFog && frame.quality === 'high' && !frame.reducedMotion;
       if (!dissolve) reveals.clear();
@@ -494,52 +562,79 @@
       return true;
     }
 
-    function drawHill(ctx, scene, frame, tile) {
-      const { x, y, by, cell } = tile;
-      const { elev = 0 } = cell;
-      if (!elev) return;
-      const project = frame.projectFloat;
-      const corners = surfaceCorners(project, x, y, elev);
-      const heights = SIDES.map(side => cliffHeight(scene.board.map, x, y, side));
+    function screeTexture() {
       const cliff = texture('cliff_face');
-      for (const [i, side] of SIDES.entries()) {
-        if (!heights[i]) continue;
-        const p = corners[side.a];
-        const q = corners[side.b];
-        if ((p.by + q.by) * 0.5 <= by + 0.001) continue;
-        const a = p.bx <= q.bx ? p : q;
-        const b = a === p ? q : p;
-        if (b.bx - a.bx < 0.01) continue;
-        const height = frame.metrics.elevH * heights[i];
-        ctx.save();
-        ctx.transform(b.bx - a.bx, b.by - a.by, 0, height, a.bx, a.by);
-        ctx.beginPath();
-        ctx.moveTo(0, 0);
-        ctx.lineTo(1, 0);
-        ctx.lineTo(1, 1);
-        for (let step = 7; step > 0; step--) {
-          ctx.lineTo(step / 8, 0.94 + 0.06 * tileHash(x, y, 716 + step + i * 11));
-        }
-        ctx.lineTo(0, 1);
-        ctx.closePath();
-        ctx.clip();
-        ctx.drawImage(cliff, 0, 0, 1, 1);
-        const slopeShade = ctx.createLinearGradient(0, 0, 0, 1);
-        slopeShade.addColorStop(0, i === 1 || i === 2 ? '#262b2a65' : '#f1d49312');
-        slopeShade.addColorStop(1, i === 1 || i === 2 ? '#1a252883' : '#2b332251');
-        ctx.fillStyle = slopeShade;
-        ctx.fillRect(0, 0, 1, 1);
-        ctx.restore();
-      }
+      if (screeSource === cliff) return scree;
+      screeSource = cliff;
+      const ctx = scree.getContext('2d');
+      const { width, height } = scree;
+      const moss = Math.floor(cliff.height * 0.14);
+      ctx.drawImage(cliff, 0, moss, cliff.width, cliff.height - moss, 0, 0, width, height);
 
-      // 連接邊向鄰格溢出極少量，消除分格裁切的反鋸齒接縫。
-      const inset = heights.map(height => height ? 0 : -0.025);
-      const radii = heights.map((height, i) => height && heights[(i + 3) % 4] ? 0.10 : 0);
+      // 碎片大多落在坡的下半，交錯亮面與陰影保留粗糙的岩面層次。
+      for (let i = 0; i < 180; i++) {
+        const x = tileHash(i, 0, 242) * width;
+        const y = Math.sqrt(tileHash(i, 0, 243)) * height;
+        const radius = 2 + tileHash(i, 0, 244) ** 2 * 13;
+        const gray = tileHash(i, 0, 245) * 25;
+        ctx.beginPath();
+        ctx.moveTo(x - radius, y + radius * 0.3);
+        ctx.lineTo(x - radius * 0.46, y - radius * 0.55);
+        ctx.lineTo(x + radius * 0.55, y - radius * 0.61);
+        ctx.lineTo(x + radius, y + radius * 0.14);
+        ctx.lineTo(x + radius * 0.31, y + radius * 0.64);
+        ctx.closePath();
+        ctx.fillStyle = `rgb(${101 + gray} ${93 + gray} ${74 + gray} / 0.82)`;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(x - radius * 0.46, y - radius * 0.55);
+        ctx.lineTo(x + radius * 0.55, y - radius * 0.61);
+        ctx.lineTo(x + radius * 0.64, y);
+        ctx.lineTo(x - radius * 0.63, y + radius * 0.02);
+        ctx.closePath();
+        ctx.fillStyle = `rgb(${151 + gray} ${141 + gray} ${114 + gray} / 0.75)`;
+        ctx.fill();
+      }
+      return scree;
+    }
+
+    function drawSlope(ctx, { polygon, rim, foot, shade, textureSpan }, fogged) {
+      const [a, b] = foot;
+      const topA = rim[0];
+      const topB = rim.at(-1);
+      const dx = (a.bx + b.bx - topA.bx - topB.bx) * 0.5;
+      const dy = (a.by + b.by - topA.by - topB.by) * 0.5;
       ctx.save();
-      transformSurface(ctx, project, x - 0.5, y - 0.5, elev);
-      ctx.beginPath();
-      roundedRect(ctx, inset[3], inset[0], 1 - inset[1], 1 - inset[2], radii);
+      tracePolygon(ctx, polygon);
+      ctx.fillStyle = '#897857';
+      ctx.fill();
       ctx.clip();
+      ctx.transform(b.bx - a.bx, b.by - a.by, dx, dy, a.bx - dx, a.by - dy);
+      const texture = screeTexture();
+      const strip = texture.width * textureSpan;
+      ctx.drawImage(texture, (texture.width - strip) * 0.5, 0, strip, texture.height, -0.15, -0.22, 1.30, 1.24);
+
+      const tint = ctx.createLinearGradient(0, 0, 0, 1);
+      tint.addColorStop(0, shade ? '#272b2560' : '#eed09628');
+      tint.addColorStop(0.76, shade ? '#25281c36' : '#78714910');
+      tint.addColorStop(1, '#656b3d90');
+      ctx.fillStyle = tint;
+      ctx.fillRect(-0.15, -0.22, 1.30, 1.24);
+      if (fogged) {
+        ctx.fillStyle = 'rgba(23, 43, 65, 0.52)';
+        ctx.fillRect(-0.15, -0.22, 1.30, 1.24);
+      }
+      ctx.restore();
+    }
+
+    function drawHill(ctx, scene, frame, tile) {
+      const { x, y, cell, hill } = tile;
+      for (const slope of hill.slopes) drawSlope(ctx, slope, !scene.visibleTiles[y][x]);
+
+      ctx.save();
+      tracePolygon(ctx, hill.top);
+      ctx.clip();
+      transformSurface(ctx, frame.projectFloat, x - 0.5, y - 0.5, cell.elev);
       const l = Math.max(0, x - 0.04);
       const t = Math.max(0, y - 0.04);
       const r = Math.min(SIZE, x + 1.04);
@@ -555,6 +650,10 @@
       const revealedAt = reveals.get(y * SIZE + x);
       if (revealedAt === undefined || frame.quality !== 'high' || frame.reducedMotion) return;
       ctx.save();
+      if (tile.hill) {
+        tracePolygon(ctx, tile.hill.top);
+        ctx.clip();
+      }
       transformSurface(ctx, frame.projectFloat, x - 0.5, y - 0.5, cell.elev || 0);
       const decay = 1 - clamp((frame.nowMs - revealedAt) / 300);
       ctx.globalAlpha *= decay * 0.19;
@@ -646,12 +745,12 @@
       if (frame.quality !== 'high' || frame.reducedMotion || scene.showAll) return;
       const { x, y, cell } = tile;
       if (cell.terrain !== 'forest' || x === 0 || y === 0 || x === SIZE - 1 || y === SIZE - 1) return;
-      if (scene.vision.tileVisible[y][x]) return;
+      if (scene.visibleTiles[y][x]) return;
       // 可見實兵或已知殘影周圍留空，霧絲永遠不會壓到其輪廓或血量提示。
       for (let cy = y - 1; cy <= y + 1; cy++) {
         for (let cx = x - 1; cx <= x + 1; cx++) {
           const key = keyOf(cx, cy);
-          if (scene.vision.tileVisible[cy][cx] || scene.visibleUnitsByKey.has(key) || scene.ghostsByKey?.has(key)) return;
+          if (scene.visibleTiles[cy][cx] || scene.visibleUnitsByKey.has(key) || scene.ghostsByKey?.has(key)) return;
         }
       }
       ctx.save();
@@ -667,12 +766,13 @@
       const regions = tacticsByTile.get(keyOf(x, y));
       if (!regions) return;
       const elev = cell.elev || 0;
+      const [top, right, bottom, left] = tile.hill?.insets ?? LEVEL_EDGES;
       for (const region of regions) {
         const [north, east, south, west] = region.boundary;
-        const l = west ? 0.06 : 0;
-        const t = north ? 0.06 : 0;
-        const r = east ? 0.94 : 1;
-        const b = south ? 0.94 : 1;
+        const l = left + (west ? 0.06 : 0);
+        const t = top + (north ? 0.06 : 0);
+        const r = 1 - right - (east ? 0.06 : 0);
+        const b = 1 - bottom - (south ? 0.06 : 0);
         const radius = 0.11;
         const corners = [north && west, north && east, south && east, south && west].map(exposed => exposed ? radius : 0);
         const project = (dx, dy) => frame.projectFloat(x + dx - 0.5, y + dy - 0.5, elev);
@@ -735,5 +835,5 @@
     };
   }
 
-  return { create, exposedSides };
+  return { create, projectHill, hillContains };
 });

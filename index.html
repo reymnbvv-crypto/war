@@ -110,14 +110,6 @@
       z-index: 3;
     }
 
-    /* 樹林處於視線內但歐距 > 2.05（無法察覺林內伏兵） */
-    .forest-conceal-overlay {
-      position: absolute;
-      inset: 0;
-      background: rgba(11, 17, 32, 0.25);
-      z-index: 3;
-    }
-
     .terrain-tag {
       position: absolute;
       top: 1px;
@@ -3756,6 +3748,11 @@
     return { id, type, faction, x, y, hp, maxHp };
   }
 
+  function isMapTileVisible(x, y, { board, vision, showAll }) {
+    // 林地須能探明內部，才會在兩種棋盤上移除迷霧。
+    return showAll || (vision.tileVisible[y][x] && isTileScanned(x, y, vision, board.map));
+  }
+
   function buildBoard25dScene(view, selUnit, ghostAt, viewKey) {
     const { board, frame, faction: viewer, vision: vv, showAll, markers } = view;
     const activeSel = (selUnit && state.phase !== 'LOCKED_END' && state.phase !== 'GAME_OVER') ? selUnit : null;
@@ -3827,7 +3824,7 @@
       viewKey,
       animateFog: !frame && !showAll,
       faction: viewer,
-      vision: { tileVisible: vv.tileVisible, forestReveal: vv.forestReveal },
+      visibleTiles: board.map.map((row, y) => row.map((_, x) => isMapTileVisible(x, y, view))),
       showAll,
       selUnit: activeSel ? snapshotHdUnit(activeSel) : null,
       reachableMap,
@@ -3877,8 +3874,6 @@
         const tile = tileRefs[y][x];
         const cell = board.map[y][x];
         const k = keyOf(x, y);
-        const isVis = showAll || vv.tileVisible[y][x];
-        const isForestRev = showAll || vv.forestReveal[y][x];
 
         const classes = ['tile'];
         let html = '';
@@ -3911,11 +3906,9 @@
           }
         }
 
-        // 4. 戰爭迷霧與林內隱蔽
-        if (!isVis) {
+        // 4. 戰爭迷霧（含仍未探明的林地）
+        if (!isMapTileVisible(x, y, view)) {
           html += `<div class="fog-overlay"></div>`;
-        } else if (cell.terrain === 'forest' && !isForestRev) {
-          html += `<div class="forest-conceal-overlay"></div><span class="terrain-tag text-emerald-100/90 bg-slate-900/60 px-1 rounded">隱</span>`;
         }
 
         // 5. 可移動格與輕騎衝鋒⚡標記
@@ -4079,8 +4072,7 @@
 
     const { x, y } = targetCoord;
     const cell = board.map[y][x];
-    const isVis = showAll || vv.tileVisible[y][x];
-    const isForestRev = showAll || vv.forestReveal[y][x];
+    const isVis = isMapTileVisible(x, y, view);
     const inZoc = !showAll && isInEnemyShieldZoc(x, y, viewer, vv, board);
 
     coordEl.textContent = `座標 (${x}, ${y})`;
@@ -4092,11 +4084,10 @@
       terrainDesc = '樹林：移動 2 MP；守方防+1（遠程再+1）；林內需歐距 ≤2.05 才現形；輕騎不可觸發衝鋒。';
     }
 
+    const fogLabel = cell.terrain === 'forest' && vv.tileVisible[y][x] ? '林內未探明' : '戰爭迷霧';
     const visBadge = isVis
-      ? (cell.terrain === 'forest' && !isForestRev
-        ? `<span class="px-1.5 py-0.5 rounded bg-amber-900/60 text-amber-200 border border-amber-700/60">視線內（林內隱蔽）</span>`
-        : `<span class="px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-200 border border-emerald-700/60">清晰可見</span>`)
-      : `<span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">戰爭迷霧</span>`;
+      ? `<span class="px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-200 border border-emerald-700/60">清晰可見</span>`
+      : `<span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">${fogLabel}</span>`;
 
     let movePreviewHtml = '';
     if (!frame && !state.aiThinking && state.phase === 'SELECT_OR_ACT' && state.selectedUnitId && state.reachableMap.has(keyOf(x, y))) {
