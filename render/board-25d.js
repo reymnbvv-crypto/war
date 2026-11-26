@@ -1284,8 +1284,14 @@
           c.fillText(String(reverse ? BOARD_SIZE - 1 - j : j), lerp(p.bx, q.bx, t),
             lerp(p.by, q.by, t) + h * 0.56);
         }
+        const prevVisible = corners[(i + 3) % 4].bx > p.bx + 1e-6;
+        const nextVisible = q.bx > corners[(i + 2) % 4].bx + 1e-6;
+        const atLeft = prevVisible ? true : (nextVisible ? false : reverse);
+        const pad = clamp(metrics.tw * 0.16, 8, 12);
+        const anchor = atLeft ? q : p;
+        const axisX = clamp(anchor.bx + (atLeft ? -pad : pad), font * 0.55, width - font * 0.55);
         c.fillStyle = '#fbbf24';
-        c.fillText(axis, reverse ? q.bx - 8 : p.bx + 8, (reverse ? q.by : p.by) + h * 0.58);
+        c.fillText(axis, axisX, anchor.by + h * 0.58);
       }
     }
 
